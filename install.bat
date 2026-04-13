@@ -43,9 +43,40 @@ if not exist "%UW2PATH%\Ultrawings 2.exe" (
 echo [OK] Found Ultrawings 2 at: %UW2PATH%
 echo.
 
-:: Check for MelonLoader
-if exist "%UW2PATH%\MelonLoader\MelonLoader.dll" (
-    echo [OK] MelonLoader is installed.
+:: Detect MelonLoader installation (supports 0.5.x through 0.7.x+)
+set "ML_FOUND=0"
+set "ML_VERSION=unknown"
+
+:: v0.7.x: version.dll proxy + MelonLoader/net6/MelonLoader.NativeHost.dll
+if exist "%UW2PATH%\version.dll" if exist "%UW2PATH%\MelonLoader\net6\MelonLoader.NativeHost.dll" (
+    set "ML_FOUND=1"
+    set "ML_VERSION=0.7.x"
+)
+
+:: v0.6.x: version.dll proxy + MelonLoader/net6/ or MelonLoader/net35/ (but no NativeHost)
+if "%ML_FOUND%"=="0" if exist "%UW2PATH%\version.dll" if exist "%UW2PATH%\MelonLoader\net6\MelonLoader.dll" (
+    set "ML_FOUND=1"
+    set "ML_VERSION=0.6.x"
+)
+if "%ML_FOUND%"=="0" if exist "%UW2PATH%\version.dll" if exist "%UW2PATH%\MelonLoader\net35\MelonLoader.dll" (
+    set "ML_FOUND=1"
+    set "ML_VERSION=0.6.x"
+)
+
+:: v0.5.x: version.dll proxy + MelonLoader/MelonLoader.dll (single file, no net6/net35 split)
+if "%ML_FOUND%"=="0" if exist "%UW2PATH%\version.dll" if exist "%UW2PATH%\MelonLoader\MelonLoader.dll" (
+    set "ML_FOUND=1"
+    set "ML_VERSION=0.5.x"
+)
+
+:: Fallback: version.dll + MelonLoader folder exists at all
+if "%ML_FOUND%"=="0" if exist "%UW2PATH%\version.dll" if exist "%UW2PATH%\MelonLoader" (
+    set "ML_FOUND=1"
+    set "ML_VERSION=unknown"
+)
+
+if "%ML_FOUND%"=="1" (
+    echo [OK] MelonLoader detected ^(v%ML_VERSION%^).
 ) else (
     echo [!] MelonLoader is NOT installed.
     echo.
