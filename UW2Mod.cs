@@ -32,6 +32,7 @@ using Il2CppCryptoTools; // CryptoConfigDO
 using Il2CppLighting;   // SKY_CONDITION
 using Il2CppVehicle;    // AircraftEngine, IEngine — live engine thrust/RPM
 using Il2CppTargetableSystem; // RigidTargetableAircraft, AircraftPhysicsController — live physics sim
+using Il2CppGameplay.Defense; // AssaultMissionController — combat signals for EFI
 
 [assembly: MelonInfo(typeof(UW2Mod.UW2TrainerMod), "UW2 Trainer", "6.0.0", "UW2Modder")]
 [assembly: MelonGame("Bit Planet Games, LLC", "Ultrawings 2")]
@@ -136,6 +137,9 @@ namespace UW2Mod
         private GameObject cachedEnemyWolf = null;
         private bool enemyPrefabsLoading = false;
         private bool enemyPrefabsReady = false;
+
+        // === BOMBER PREFAB CACHE ===
+        private List<GameObject> cachedBomberPrefabs = new List<GameObject>();
 
         // === GROUND VEHICLE PREFAB CACHE ===
         private List<GameObject> cachedGroundVehicles = new List<GameObject>(); // CombatVehicle, AdvancedCombatVehicle
@@ -242,6 +246,13 @@ namespace UW2Mod
 
         // === PLAYER HP TRACKING ===
         private float playerBaseHP = -1f; // detected on first aircraft entry
+
+        // === EFI INTEGRATION (cockpit screen) ===
+        private Il2Cpp.EFIFreeFlightScreenView cachedEFIScreenView = null;
+        private Il2Cpp.EFISoundsController cachedEFISounds = null;
+        private Il2Cpp.FreeFlightEFIMediator cachedFreeFlightMediator = null;
+        private bool efiHooked = false;
+        private float efiTextTimer = 0f;
 
         private struct CombatZone
         {
@@ -425,12 +436,65 @@ namespace UW2Mod
                         if (bomberPrefab != null)
                         {
                             LoggerInstance.Msg($"[SCENE]   AirDefense: bomberPrefab='{bomberPrefab.name}'");
-                            // Store bombers in the fighter prefab list for now
-                            if (!cachedFighterPrefabs.Contains(bomberPrefab))
+
+                            // Check if already cached
+                            bool bomberDup = false;
+                            foreach (var bp in cachedBomberPrefabs) { if (bp != null && bp.name == "HS_Bomber_" + bomberPrefab.name) { bomberDup = true; break; } }
+
+                            if (!bomberDup)
                             {
-                                cachedFighterPrefabs.Add(bomberPrefab);
-                                found++;
-                                LoggerInstance.Msg($"[SCENE]   *** CACHED bomber prefab: '{bomberPrefab.name}' ***");
+                                var bomberClone = CloneAsPrefabTemplate(bomberPrefab, "HS_Bomber_" + bomberPrefab.name);
+                                if (bomberClone != null)
+                                {
+                                    cachedBomberPrefabs.Add(bomberClone);
+                                    found++;
+                                    LoggerInstance.Msg($"[SCENE]   *** CACHED BOMBER: '{bomberClone.name}' ***");
+
+                                    // === BOMBER WEAPON DUMP — log everything about the bomber's weapon system ===
+                                    try
+                                    {
+                                        var bomberFMs = bomberPrefab.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(true);
+                                        LoggerInstance.Msg($"[SCENE]   BOMBER WEAPONS: {bomberFMs?.Length ?? 0} FiringMechanisms");
+                                        for (int f = 0; f < (bomberFMs?.Length ?? 0); f++)
+                                        {
+                                            var fm = bomberFMs[f];
+                                            string fmName = fm.gameObject.name;
+                                            string fmType = fm.GetIl2CppType().Name;
+                                            LoggerInstance.Msg($"[SCENE]     FM[{f}]: '{fmName}' type={fmType} enabled={fm.m_isEnabled}");
+                                            try
+                                            {
+                                                var config = fm.m_firingMechanismConfig;
+                                                if (config != null)
+                                                    LoggerInstance.Msg($"[SCENE]       Config: RPM={config.m_roundsPerMinute} cooldown={config.m_cooldownTime} maxAmmo={config.m_maxAmmo} infinite={config.m_isInfiniteAmmo}");
+                                            }
+                                            catch { }
+                                            // Log projectile type
+                                            try { LoggerInstance.Msg($"[SCENE]       ProjectileLoadoutIndex={fm.m_projectileLoadoutIndex}"); } catch { }
+                                        }
+
+                                        // Also log WeaponAttachment
+                                        var bomberWA = bomberPrefab.GetComponentInChildren<Il2CppWeapon.WeaponAttachment>(true);
+                                        if (bomberWA != null)
+                                        {
+                                            LoggerInstance.Msg($"[SCENE]   BOMBER WeaponAttachment: forceSpawnAll={bomberWA.m_forceSpawnAll}");
+                                            try
+                                            {
+                                                var hardpoints = bomberWA.m_hardPoints;
+                                                LoggerInstance.Msg($"[SCENE]     Hardpoints: {hardpoints?.Count ?? 0}");
+                                            }
+                                            catch { }
+                                        }
+
+                                        // Log ALL components on the bomber for reference
+                                        var bomberComps = bomberPrefab.GetComponentsInChildren<Component>(true);
+                                        LoggerInstance.Msg($"[SCENE]   BOMBER COMPONENTS ({bomberComps.Length} total):");
+                                        for (int c = 0; c < Math.Min(bomberComps.Length, 40); c++)
+                                        {
+                                            try { LoggerInstance.Msg($"[SCENE]     [{c}] {bomberComps[c].GetIl2CppType().Name} on '{bomberComps[c].gameObject.name}'"); } catch { }
+                                        }
+                                    }
+                                    catch (Exception ex) { LoggerInstance.Msg($"[SCENE]   Bomber weapon dump: {ex.Message}"); }
+                                }
                             }
                         }
 
@@ -642,6 +706,70 @@ namespace UW2Mod
             }
             catch { }
 
+            // 10. AircraftBomber — scan directly (not always on AirDefenseMissionController)
+            try
+            {
+                var allBombers = Resources.FindObjectsOfTypeAll<Il2CppGameplay.BomberRush.AircraftBomber>();
+                LoggerInstance.Msg($"[SCENE]   AircraftBomber scan: {allBombers?.Length ?? 0} found");
+                for (int i = 0; i < (allBombers?.Length ?? 0); i++)
+                {
+                    try
+                    {
+                        var bomberGO = allBombers[i].gameObject;
+                        string bName = bomberGO.name;
+                        if (bName.StartsWith("HS_")) continue;
+
+                        // Use the bomber's own GameObject, NOT the mission root
+                        // The root is often the entire mission controller with destroyers etc.
+                        LoggerInstance.Msg($"[SCENE]   AircraftBomber: '{bName}' root='{bomberGO.transform.root.gameObject.name}'");
+
+                        bool dup = false;
+                        string templateName = "HS_Bomber_" + bName;
+                        foreach (var bp in cachedBomberPrefabs) { if (bp != null && bp.name == templateName) { dup = true; break; } }
+                        if (dup) continue;
+
+                        // Clone the bomber GameObject itself (not the mission root)
+                        var clone = CloneAsPrefabTemplate(bomberGO, templateName);
+                        if (clone != null)
+                        {
+                            cachedBomberPrefabs.Add(clone);
+                            found++;
+                            LoggerInstance.Msg($"[SCENE]   *** CACHED BOMBER: '{templateName}' ***");
+
+                            // Full weapon dump on the INDIVIDUAL bomber
+                            try
+                            {
+                                var fms = bomberGO.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(true);
+                                LoggerInstance.Msg($"[SCENE]   BOMBER WEAPONS: {fms?.Length ?? 0} FiringMechanisms");
+                                for (int f = 0; f < (fms?.Length ?? 0); f++)
+                                {
+                                    var fm = fms[f];
+                                    LoggerInstance.Msg($"[SCENE]     FM[{f}]: '{fm.gameObject.name}' type={fm.GetIl2CppType().Name} enabled={fm.m_isEnabled}");
+                                    try
+                                    {
+                                        var config = fm.m_firingMechanismConfig;
+                                        if (config != null)
+                                            LoggerInstance.Msg($"[SCENE]       Config: RPM={config.m_roundsPerMinute} cooldown={config.m_cooldownTime} maxAmmo={config.m_maxAmmo} infinite={config.m_isInfiniteAmmo}");
+                                    }
+                                    catch { }
+                                }
+
+                                // Log all components on the individual bomber
+                                var comps = bomberGO.GetComponentsInChildren<Component>(true);
+                                LoggerInstance.Msg($"[SCENE]   BOMBER COMPONENTS ({comps.Length}):");
+                                for (int c = 0; c < Math.Min(comps.Length, 50); c++)
+                                {
+                                    try { LoggerInstance.Msg($"[SCENE]     [{c}] {comps[c].GetIl2CppType().Name} on '{comps[c].gameObject.name}'"); } catch { }
+                                }
+                            }
+                            catch (Exception ex) { LoggerInstance.Msg($"[SCENE]   Bomber dump: {ex.Message}"); }
+                        }
+                    }
+                    catch { }
+                }
+            }
+            catch { }
+
             // NOTE: Civilian vehicles (ConvoyVehicle without turrets) are NOT cloned — no moving ground assets needed
 
             // 11. Scan all GameObjects for escort/enemy-named objects with AI
@@ -675,7 +803,7 @@ namespace UW2Mod
 
             if (found > 0)
             {
-                LoggerInstance.Msg($"[SCENE] === Cached {found} combat prefabs! fighters={enemyPrefabsReady} turrets={cachedTurretPrefabs.Count} ships={cachedShipPrefabs.Count} vehicles={cachedGroundVehicles.Count} civilian={cachedCivilianVehicles.Count} ===");
+                LoggerInstance.Msg($"[SCENE] === Cached {found} combat prefabs! fighters={enemyPrefabsReady} bombers={cachedBomberPrefabs.Count} turrets={cachedTurretPrefabs.Count} ships={cachedShipPrefabs.Count} vehicles={cachedGroundVehicles.Count} ===");
                 combatPrefabsScanned = true;
 
                 // Update collection tracker
@@ -1108,6 +1236,7 @@ namespace UW2Mod
                             hasSafePosition = false;
                             playerBaseHP = -1f; // reset so upgrades re-cache original HP
                             cachedSecondaryFM = null; // reset secondary weapon cache for new aircraft
+                            hsWeaponsEnabled = false; // re-enable weapons on new aircraft
                             LoggerInstance.Msg($"[SPAWN] New aircraft detected: '{acName}' — spawn protection ON");
                             try { ApplyUpgrades(); } catch { }
                             // Enemy prefabs load on-demand when player activates Hostile Skies (not here — additive scene load during game state transition causes crash)
@@ -3945,6 +4074,7 @@ namespace UW2Mod
         private void ScanCombatPrefabs()
         {
             cachedFighterPrefabs.Clear();
+            cachedBomberPrefabs.Clear();
             cachedTurretPrefabs.Clear();
             cachedShipPrefabs.Clear();
             cachedGroundVehicles.Clear();
@@ -6856,6 +6986,9 @@ namespace UW2Mod
 
                     LoggerInstance.Msg($"[HS] +{killed} kills! +{killScrap} scrap Total={totalKills} Streak={killStreak} Scrap={scrap}");
                     CheckUnlocks();
+
+                    // EFI: Update kill count on cockpit screen
+                    EFI_UpdateKills(totalKills);
                 }
 
                 // Always clean wave enemy list (even if no kills — handles despawned enemies)
@@ -6887,6 +7020,30 @@ namespace UW2Mod
                 }
             }
 
+            // Retry EFI hook if not connected yet (scene may not have been ready)
+            if (!efiHooked && hsStateTimer > 3f)
+            {
+                TryHookEFI();
+            }
+
+            // Keep scrap text updated on EFI (throttled to 1/sec — game overwrites earnings text)
+            efiTextTimer += Time.deltaTime;
+            if (efiHooked && cachedEFIScreenView != null && efiTextTimer >= 1f)
+            {
+                efiTextTimer = 0f;
+                try
+                {
+                    if (cachedEFIScreenView.m_earningsText != null)
+                    {
+                        string efiText = hsState == HS_ENGAGEMENT
+                            ? $"SCRAP: {scrap}  |  WAVE {currentWave}/{totalWaves}  |  KILLS: {sessionKills}"
+                            : $"SCRAP: {scrap}  |  KILLS: {totalKills}";
+                        cachedEFIScreenView.m_earningsText.text = efiText;
+                    }
+                }
+                catch { }
+            }
+
             // --- State Machine ---
             switch (hsState)
             {
@@ -6899,6 +7056,10 @@ namespace UW2Mod
                     LoggerInstance.Msg("[HS] State → ROAMING");
                     SetStatus("ROAMING — Fly to a zone or use 'Start Engagement' on the panel");
                     if (!hsMusicPlaying) PlayHSMusic();
+                    // Hook into EFI cockpit screen
+                    TryHookEFI();
+                    // Auto-enable weapons
+                    try { HSAutoEnableWeapons(); } catch (Exception ex) { LoggerInstance.Msg($"[HS] Weapon enable error: {ex.Message}"); }
                     break;
 
                 case HS_ROAMING:
@@ -7025,6 +7186,10 @@ namespace UW2Mod
             LoggerInstance.Msg($"[HS] State → ENGAGEMENT at '{zoneName}' | Threat {threatLevel} | {totalWaves} waves");
             SetStatus($"ENGAGEMENT! Threat {threatLevel} — {totalWaves} wave{(totalWaves > 1 ? "s" : "")}");
 
+            // EFI: Switch to assault mode on cockpit screen
+            if (!efiHooked) TryHookEFI();
+            EFI_AssaultInitiated();
+
             // Spawn first wave
             HSSpawnNextWave();
         }
@@ -7055,6 +7220,10 @@ namespace UW2Mod
 
             LoggerInstance.Msg($"[HS] Wave {currentWave}/{totalWaves} — spawning {fighters} fighters");
             SetStatus($"Wave {currentWave}/{totalWaves} — {fighters} hostiles incoming!");
+
+            // EFI: Update wave counter + play enemy alert sound
+            EFI_UpdateWave(currentWave);
+            EFI_EnemySpawned();
 
             // Track which enemies belong to this wave (store count before spawn)
             int beforeCount = spawnedCombatants.Count;
@@ -7188,6 +7357,232 @@ namespace UW2Mod
         }
 
         // ================================================================
+        // HOSTILE SKIES — AUTO-ENABLE WEAPONS
+        // ================================================================
+        private bool hsWeaponsEnabled = false;
+
+        private void HSAutoEnableWeapons()
+        {
+            var ac = GameManager.ControllerAircraft;
+            if (ac == null) return;
+            if (hsWeaponsEnabled) return;
+
+            try
+            {
+                var wa = ac.gameObject.GetComponentInChildren<Il2CppWeapon.WeaponAttachment>(true);
+                if (wa != null)
+                {
+                    wa.m_forceSpawnAll = true;
+                    wa.SpawnWeapons();
+                    LoggerInstance.Msg("[HS] Weapons force-spawned");
+                }
+
+                var vs = GameManager.VehicleSetup;
+                if (vs != null)
+                {
+                    if (vs.m_controllerAircraft == null) vs.m_controllerAircraft = ac;
+                    vs.m_gunInitComplete = false;
+                    vs.InitializeWeaponSystems();
+                    vs.m_gunInitComplete = true;
+                    LoggerInstance.Msg("[HS] Weapon systems initialized");
+                }
+
+                // Activate gun mount points
+                var allT = ac.gameObject.GetComponentsInChildren<Transform>(true);
+                for (int i = 0; i < allT.Length; i++)
+                {
+                    if (!allT[i].gameObject.activeSelf)
+                    {
+                        string gn = allT[i].gameObject.name.ToLower();
+                        if (gn.Contains("machine gun point"))
+                            allT[i].gameObject.SetActive(true);
+                    }
+                }
+
+                // Now set up grenade as secondary weapon on the LAST weapon slot
+                try
+                {
+                    var grenadeCfg = FindWeaponConfig("cfg_friendly_grenadelauncher");
+                    if (grenadeCfg != null)
+                    {
+                        var weapons = ac.gameObject.GetComponentsInChildren<Il2CppWeapon.Weapon>(true);
+                        if (weapons != null && weapons.Length > 1)
+                        {
+                            // Swap the last weapon to grenades (keep first as primary)
+                            weapons[weapons.Length - 1].SetConfig(grenadeCfg);
+                            LoggerInstance.Msg($"[HS] Secondary weapon set to grenades on slot {weapons.Length - 1}");
+                        }
+                        else if (weapons != null && weapons.Length == 1)
+                        {
+                            // Only one weapon — log but don't swap (it's the primary)
+                            LoggerInstance.Msg("[HS] Only 1 weapon slot — no secondary available");
+                        }
+                    }
+                    else
+                    {
+                        LoggerInstance.Msg("[HS] Grenade config not found in memory — secondary unavailable until a combat mission is played");
+                    }
+                }
+                catch (Exception ex) { LoggerInstance.Msg($"[HS] Secondary weapon setup: {ex.Message}"); }
+
+                // Reset secondary cache so it finds the new grenade FM
+                cachedSecondaryFM = null;
+                cachedSecondaryAircraftName = "";
+
+                hsWeaponsEnabled = true;
+                LoggerInstance.Msg($"[HS] Weapons auto-enabled on '{ac.gameObject.name}'");
+            }
+            catch (Exception ex) { LoggerInstance.Msg($"[HS] Auto-enable weapons failed: {ex.Message}"); }
+        }
+
+        private Il2CppWeapon.WeaponConfigDO FindWeaponConfig(string configName)
+        {
+            try
+            {
+                var allCfg = Resources.FindObjectsOfTypeAll<Il2CppWeapon.WeaponConfigDO>();
+                for (int i = 0; i < (allCfg?.Length ?? 0); i++)
+                {
+                    if (allCfg[i].name == configName) return allCfg[i];
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        // ================================================================
+        // HOSTILE SKIES — EFI COCKPIT INTEGRATION
+        // ================================================================
+        private void TryHookEFI()
+        {
+            if (efiHooked) return;
+
+            try
+            {
+                // Find FreeFlightEFIMediator
+                var mediators = Resources.FindObjectsOfTypeAll<Il2Cpp.FreeFlightEFIMediator>();
+                if (mediators != null && mediators.Length > 0)
+                {
+                    cachedFreeFlightMediator = mediators[0];
+                    LoggerInstance.Msg($"[HS-EFI] Found FreeFlightEFIMediator");
+
+                    // Get the screen view
+                    try
+                    {
+                        cachedEFIScreenView = cachedFreeFlightMediator.m_efiFreeFlightScreenView;
+                        if (cachedEFIScreenView != null)
+                            LoggerInstance.Msg($"[HS-EFI] EFIFreeFlightScreenView found — earningsText={cachedEFIScreenView.m_earningsText != null}");
+                    }
+                    catch (Exception ex) { LoggerInstance.Msg($"[HS-EFI] Screen view access: {ex.Message}"); }
+                }
+                else
+                {
+                    LoggerInstance.Msg("[HS-EFI] No FreeFlightEFIMediator found yet");
+                }
+
+                // Find EFISoundsController
+                var sounds = Resources.FindObjectsOfTypeAll<Il2Cpp.EFISoundsController>();
+                if (sounds != null && sounds.Length > 0)
+                {
+                    cachedEFISounds = sounds[0];
+                    LoggerInstance.Msg($"[HS-EFI] EFISoundsController found");
+                }
+
+                efiHooked = cachedFreeFlightMediator != null;
+                if (efiHooked)
+                    LoggerInstance.Msg("[HS-EFI] === EFI HOOKED SUCCESSFULLY ===");
+            }
+            catch (Exception ex) { LoggerInstance.Msg($"[HS-EFI] Hook failed: {ex.Message}"); }
+        }
+
+        private void EFI_AssaultInitiated()
+        {
+            // Fire the assault signal to switch EFI to combat display
+            try
+            {
+                var signal = AssaultMissionController.AssaultInitiated;
+                if (signal != null) { signal.Dispatch(); LoggerInstance.Msg("[HS-EFI] AssaultInitiated dispatched"); }
+            }
+            catch (Exception ex) { LoggerInstance.Msg($"[HS-EFI] AssaultInitiated: {ex.Message}"); }
+
+            // Also try calling GoAssaultMode directly on the screen view
+            try
+            {
+                if (cachedEFIScreenView != null)
+                {
+                    cachedEFIScreenView.GoAssaultMode();
+                    LoggerInstance.Msg("[HS-EFI] GoAssaultMode() called");
+                }
+            }
+            catch (Exception ex) { LoggerInstance.Msg($"[HS-EFI] GoAssaultMode: {ex.Message}"); }
+        }
+
+        private void EFI_UpdateKills(int totalKills)
+        {
+            try
+            {
+                var signal = AssaultMissionController.ConfirmedKillsUpdate;
+                if (signal != null) signal.Dispatch(totalKills);
+            }
+            catch { }
+
+            // Also directly update the earnings text as scrap display
+            try
+            {
+                if (cachedEFIScreenView != null && cachedEFIScreenView.m_earningsText != null)
+                    cachedEFIScreenView.m_earningsText.text = $"SCRAP: {scrap}";
+            }
+            catch { }
+        }
+
+        private void EFI_UpdateWave(int wave)
+        {
+            try
+            {
+                var signal = AssaultMissionController.WaveIndexUpdated;
+                if (signal != null) signal.Dispatch(wave);
+            }
+            catch { }
+
+            // Also update star/wave display
+            try
+            {
+                if (cachedEFIScreenView != null)
+                    cachedEFIScreenView.UpdateStarWave(wave);
+            }
+            catch { }
+        }
+
+        private void EFI_EnemySpawned()
+        {
+            // Play enemy alert bell
+            try
+            {
+                if (cachedEFISounds != null)
+                    cachedEFISounds._OnEnemySpawned();
+            }
+            catch { }
+
+            // Also fire game signal
+            try
+            {
+                var signal = Il2Cpp.GameSignals.EnemySpawned;
+                if (signal != null) signal.Dispatch();
+            }
+            catch { }
+        }
+
+        private void EFI_PlayerHitEnemy()
+        {
+            // Play hit confirmation sound via EFI sfx
+            try
+            {
+                if (cachedEFISounds != null)
+                    cachedEFISounds._PlayEFISfxType(Il2Cpp.EFISfxType.Enum.CenterRingSfx); // reuse as hit confirm
+            }
+            catch { }
+        }
+
+        // ================================================================
         // HOSTILE SKIES — IN-GAME TOAST NOTIFICATION
         // ================================================================
         private void ShowGameToast(string message, int durationSeconds = 5)
@@ -7221,25 +7616,43 @@ namespace UW2Mod
 
         private void UpdateSecondaryWeapon()
         {
-            if (!hostileSkiesActive || !grenadesUnlocked) return;
-            if (showMenu) return; // don't fire while in menu
+            if (!hostileSkiesActive) return;
+            if (showMenu || wristPanelVisible) return; // don't fire when any UI is open
 
             // Cooldown tick
             if (secondaryFireCooldown > 0f)
             {
                 secondaryFireCooldown -= Time.deltaTime;
-                return; // still on cooldown, skip input check entirely
+                // Release trigger state when not firing
+                if (cachedSecondaryFM != null)
+                    try { cachedSecondaryFM.m_triggerWasPulled = false; } catch { }
+                return;
             }
 
-            // Check left index trigger (only edge detect, not held)
-            bool leftTrigger = false;
-            try { leftTrigger = OVRInput.Get(OVRInput.RawButton.LIndexTrigger); } catch { }
-            if (!leftTrigger && !Input.GetKey(KeyCode.G)) return; // G key as keyboard fallback
+            // A button (right controller) = secondary weapon, hold to fire continuously
+            // G key = keyboard fallback
+            bool aButton = false;
+            try { aButton = OVRInput.Get(OVRInput.Button.One, OVRInput.Controller.RTouch); } catch { }
+            // Also try raw button in case mapped differently
+            bool aButtonRaw = false;
+            try { aButtonRaw = OVRInput.Get(OVRInput.RawButton.A); } catch { }
+            bool firing = aButton || aButtonRaw || Input.GetKey(KeyCode.G);
 
-            // Edge detection — fire once per trigger pull, not while held
-            bool wasDown = leftTriggerWasDown;
-            leftTriggerWasDown = leftTrigger;
-            if (leftTrigger && wasDown) return; // held — don't re-fire
+            // Debug: log once when first detected
+            if (firing && !leftTriggerWasDown)
+            {
+                LoggerInstance.Msg($"[HS] Secondary input detected: aButton={aButton} aButtonRaw={aButtonRaw} G={Input.GetKey(KeyCode.G)} cachedFM={cachedSecondaryFM != null}");
+                leftTriggerWasDown = true;
+            }
+            if (!firing) leftTriggerWasDown = false;
+
+            if (!firing)
+            {
+                // Release trigger when not pressing
+                if (cachedSecondaryFM != null)
+                    try { cachedSecondaryFM.m_triggerWasPulled = false; } catch { }
+                return;
+            }
 
             var ac = GameManager.ControllerAircraft;
             if (ac == null) return;
@@ -7251,44 +7664,44 @@ namespace UW2Mod
                 cachedSecondaryAircraftName = acName;
                 cachedSecondaryFM = null;
 
-                // First ensure weapons are spawned (grenades need m_forceSpawnAll)
+                // Find the secondary FiringMechanism (grenade/last weapon slot)
                 try
                 {
-                    var wa = ac.gameObject.GetComponentInChildren<Il2CppWeapon.WeaponAttachment>(true);
-                    if (wa != null && !wa.m_forceSpawnAll)
+                    // Strategy: the last Weapon component was swapped to grenades by HSAutoEnableWeapons
+                    // Find its FiringMechanismBase
+                    var allWeapons = ac.gameObject.GetComponentsInChildren<Il2CppWeapon.Weapon>(true);
+                    if (allWeapons != null && allWeapons.Length > 1)
                     {
-                        wa.m_forceSpawnAll = true;
-                        wa.SpawnWeapons();
-                        var vs = GameManager.VehicleSetup;
-                        if (vs != null) { vs.m_controllerAircraft = ac; vs.m_gunInitComplete = false; vs.InitializeWeaponSystems(); vs.m_gunInitComplete = true; }
-                        LoggerInstance.Msg("[HS] Force-spawned weapons for secondary weapon access");
+                        // Last weapon = secondary (was swapped to grenades)
+                        var secondaryWeapon = allWeapons[allWeapons.Length - 1];
+                        var fm = secondaryWeapon.gameObject.GetComponentInChildren<Il2CppWeapon.FiringMechanismBase>(true);
+                        if (fm != null)
+                        {
+                            cachedSecondaryFM = fm;
+                            LoggerInstance.Msg($"[HS] Secondary weapon cached from last weapon slot: '{fm.gameObject.name}'");
+                        }
                     }
-                }
-                catch { }
 
-                // Find the grenade launcher FiringMechanism
-                try
-                {
-                    var allFMs = ac.gameObject.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(true);
-                    for (int i = 0; i < (allFMs?.Length ?? 0); i++)
+                    // Fallback: search by name
+                    if (cachedSecondaryFM == null)
                     {
-                        try
+                        var allFMs = ac.gameObject.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(true);
+                        for (int i = 0; i < (allFMs?.Length ?? 0); i++)
                         {
                             string fmName = allFMs[i].gameObject.name.ToLower();
                             if (fmName.Contains("grenade") || fmName.Contains("launcher"))
                             {
                                 cachedSecondaryFM = allFMs[i];
-                                LoggerInstance.Msg($"[HS] Secondary weapon cached: '{allFMs[i].gameObject.name}'");
+                                LoggerInstance.Msg($"[HS] Secondary weapon cached by name: '{allFMs[i].gameObject.name}'");
                                 break;
                             }
                         }
-                        catch { }
-                    }
-                    // Fallback: if no grenade-named FM found, look for one that's NOT the primary
-                    if (cachedSecondaryFM == null && allFMs != null && allFMs.Length > 1)
-                    {
-                        cachedSecondaryFM = allFMs[allFMs.Length - 1]; // last FM is usually the secondary
-                        LoggerInstance.Msg($"[HS] Secondary weapon (fallback): '{cachedSecondaryFM.gameObject.name}'");
+                        // Last resort: use the last FM
+                        if (cachedSecondaryFM == null && allFMs != null && allFMs.Length > 1)
+                        {
+                            cachedSecondaryFM = allFMs[allFMs.Length - 1];
+                            LoggerInstance.Msg($"[HS] Secondary weapon (last FM fallback): '{cachedSecondaryFM.gameObject.name}'");
+                        }
                     }
                 }
                 catch (Exception ex) { LoggerInstance.Msg($"[HS] Secondary weapon search failed: {ex.Message}"); }
@@ -7296,7 +7709,7 @@ namespace UW2Mod
 
             if (cachedSecondaryFM == null) return;
 
-            // Fire the grenade!
+            // Fire! Hold A = continuous fire with cooldown between shots
             try
             {
                 cachedSecondaryFM.gameObject.SetActive(true);
@@ -7304,7 +7717,6 @@ namespace UW2Mod
                 cachedSecondaryFM.m_readyToFire = true;
                 cachedSecondaryFM.m_triggerWasPulled = true;
                 secondaryFireCooldown = GRENADE_FIRE_INTERVAL;
-                LoggerInstance.Msg("[HS] Secondary weapon FIRED");
             }
             catch (Exception ex) { LoggerInstance.Msg($"[HS] Secondary fire failed: {ex.Message}"); }
         }

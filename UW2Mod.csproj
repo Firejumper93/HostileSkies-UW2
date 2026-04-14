@@ -94,6 +94,11 @@
       <HintPath>$(Il2CppDir)\Il2CppOculus.VR.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- TextMeshPro — for EFI cockpit text -->
+    <Reference Include="Unity.TextMeshPro">
+      <HintPath>$(Il2CppDir)\Unity.TextMeshPro.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
   <!-- Auto-copy to Mods folder after build -->
