@@ -234,7 +234,6 @@ Press **F2** to toggle an overlay showing:
 | Weapons in Free Flight | Force-enable aircraft weapons outside missions |
 | Ammo Swap | Switch between bullet types (grenades, darts, Stallion rounds) |
 | Grenade/Dart Equip | Equip handheld weapons |
-| Laser Designator | Activate laser targeting |
 
 ---
 
