@@ -43,7 +43,7 @@ namespace UW2Mod
         // === STATE ===
         private bool showMenu = false;
         private int activeTab = 0;
-        private readonly string[] tabNames = { "Cheats", "Flight", "Combat", "Physics", "Aircraft", "Explore", "Info", "Diag" };
+        private readonly string[] tabNames = { "Cheats", "Flight", "Hostile Skies", "Physics", "Aircraft", "Explore", "Info", "Diag" };
         private bool initialized = false;
         private float initRetryTimer = 0f;
 
@@ -69,6 +69,10 @@ namespace UW2Mod
         private float maxDragClamp = -1f; // -1 = disabled. When set, rb.drag is clamped to this max value every frame
         private Dictionary<string, float> origEngineForce = new Dictionary<string, float>(); // original m_forceAtMaxRPM per engine
         private string modSettingsPath;
+
+        // === CACHED REFS (avoid per-frame GetComponent) ===
+        private Rigidbody cachedPlayerRb = null;
+        private GameObject cachedPlayerAircraftGO = null;
 
         // === HUD ===
         private bool showHUD = false;
@@ -111,6 +115,7 @@ namespace UW2Mod
             public float breakTimer = 0f;
             public Vector3 breakDir;
             public float bankAngle = 0f;      // visual banking
+            public Il2CppWeapon.FiringMechanismBase[] cachedWeapons = null;
         }
         private List<DroneAI> activeDrones = new List<DroneAI>();
 
@@ -131,6 +136,19 @@ namespace UW2Mod
         private GameObject cachedEnemyWolf = null;
         private bool enemyPrefabsLoading = false;
         private bool enemyPrefabsReady = false;
+
+        // === GROUND VEHICLE PREFAB CACHE ===
+        private List<GameObject> cachedGroundVehicles = new List<GameObject>(); // CombatVehicle, AdvancedCombatVehicle
+        private List<GameObject> cachedCivilianVehicles = new List<GameObject>(); // ConvoyVehicle, CivilianVehicle
+
+        // === HOSTILE SKIES UNLOCK TRACKING ===
+        // Tracks which prefab categories have been collected across missions
+        private bool hsHasFighters = false;    // Messer or Wolf
+        private bool hsHasTurrets = false;     // SimpleTurret
+        private bool hsHasShips = false;       // NavalShip
+        private bool hsHasGroundVehicles = false; // CombatVehicle / AdvancedCombatVehicle
+        private bool hsFullyUnlocked = false;  // all categories collected
+        private bool hsUnlockNotified = false;  // prevent repeat notification
         private string savedCombatSceneName = "";  // persisted — scene that had enemy prefabs
         private int savedCombatSceneIndex = -1;    // persisted — build index of that scene
         private bool combatSceneAutoLoaded = false; // true once we've auto-loaded on startup
@@ -148,7 +166,7 @@ namespace UW2Mod
         // === HOSTILE SKIES ===
         private bool hostileSkiesActive = false;
         private int threatLevel = 1;
-        private int threatLevelUnlocked = 2; // start with levels 1-2 unlocked
+        private int threatLevelUnlocked = 5; // all levels unlocked for testing
         private int totalKills = 0;
         private int sessionKills = 0;
         private int killStreak = 0;
@@ -163,6 +181,67 @@ namespace UW2Mod
         private float ambientSpawnTimer = 0f;
         private float killCheckTimer = 0f;
         private int previousCombatantCount = 0;
+
+        // === HOSTILE SKIES STATE MACHINE ===
+        const int HS_INACTIVE = 0, HS_ROAMING = 1, HS_ENGAGEMENT = 2,
+                  HS_WAVE_COMPLETE = 3, HS_SHOP = 4, HS_DEFEATED = 5;
+        private int hsState = HS_INACTIVE;
+        private float hsStateTimer = 0f;
+        private static readonly string[] hsStateNames = { "INACTIVE", "ROAMING", "ENGAGEMENT", "WAVE COMPLETE", "SHOP", "DEFEATED" };
+
+        // === CURRENCY (Scrap) ===
+        private int scrap = 0;
+        private int totalScrapEarned = 0;
+        private float streakMultiplier = 1.0f;
+
+        // === HS BALANCE CONSTANTS ===
+        const int SCRAP_PER_FIGHTER = 100;
+        const int SCRAP_PER_TURRET = 50;
+        const int SCRAP_PER_DESTROYER = 300;
+        const int SCRAP_PER_ACE = 500;
+        const int SCRAP_WAVE_BONUS_BASE = 200;
+        const int SCRAP_ENGAGEMENT_BONUS_BASE = 500;
+        const int SCRAP_RING_BONUS = 50;
+        const float STREAK_MULTIPLIER_INCREMENT = 0.1f;
+        const float STREAK_MULTIPLIER_CAP = 2.0f;
+        static readonly int[] UPGRADE_COSTS = { 500, 1500, 4000, 10000 };
+        const float WAVE_COMPLETE_PAUSE = 10f;
+
+        // === UPGRADES (tiers 0-4, persisted) ===
+        private int upgradeArmor = 0;
+        private int upgradeFireRate = 0;
+        private int upgradeAmmoCapacity = 0;
+        private int upgradeSpeed = 0;
+        private int upgradeHandling = 0;
+        private Dictionary<string, float[]> origUpgradeValues = new Dictionary<string, float[]>(); // cache original values per aircraft
+
+        // === WAVE MANAGEMENT ===
+        private int currentWave = 0;
+        private int totalWaves = 0;
+        private int waveKills = 0;
+        private int waveTargetKills = 0;
+        private int engagementKills = 0;
+        private int currentEngagementZoneIndex = -1; // which zone triggered this engagement
+        private List<GameObject> currentWaveEnemies = new List<GameObject>();
+
+        // === AMMO / DUAL WEAPON SYSTEM ===
+        // Right trigger = primary (machinegun/cannon), Left trigger = secondary (grenades/explosives)
+        private int secondaryWeaponType = 0; // 0=none, 1=explosive, 2=grenades
+        private bool explosiveAmmoUnlocked = false;
+        // grenadesUnlocked already exists above
+        private bool leftTriggerWasDown = false; // edge detection for left trigger
+
+        // === SPEED PRESETS ===
+        private int activeSpeedPreset = 0;
+        private bool landingMode = false;
+        private static readonly string[] speedPresetNames = { "Stock", "Sport", "Combat", "Ace", "Afterburn" };
+        private static readonly float[] speedPresetPower =    { 1.0f, 2.0f, 3.0f, 5.0f, 5.0f };
+        private static readonly float[] speedPresetDrag =     { 1.0f, 0.7f, 0.5f, 0.3f, 0.2f };
+        private static readonly float[] speedPresetAntiPitch = { 0f, 1.5f, 2.5f, 4.0f, 5.0f };
+        private static readonly float[] speedPresetBoost =    { 0f, 0f, 0f, 0f, 10000f };
+
+        // === PLAYER HP TRACKING ===
+        private float playerBaseHP = -1f; // detected on first aircraft entry
 
         private struct CombatZone
         {
@@ -287,6 +366,23 @@ namespace UW2Mod
 
             LoggerInstance.Msg($"[SCENE] === Scanning scene '{pendingSceneName}' (index={pendingSceneIndex}) for combat prefabs ===");
             int found = 0;
+
+            // SAFETY: Disable CombatMission components immediately to prevent them from
+            // running game state logic during additive loads (causes NullRef crash)
+            if (combatSceneAutoLoaded)
+            {
+                try
+                {
+                    var allCombatMissions = Resources.FindObjectsOfTypeAll<Il2CppGameplay.TargetElimination2.CombatMission>();
+                    for (int i = 0; i < (allCombatMissions?.Length ?? 0); i++)
+                    {
+                        try { allCombatMissions[i].gameObject.SetActive(false); }
+                        catch { }
+                    }
+                    LoggerInstance.Msg($"[SCENE] Disabled {allCombatMissions?.Length ?? 0} CombatMission components (prevent crash)");
+                }
+                catch { }
+            }
 
             // 1. AirDefensePatrolGroup — holds m_enemyAircraftPrefab (fighter prefab)
             try
@@ -434,24 +530,121 @@ namespace UW2Mod
             }
             catch { }
 
-            // 7. SimpleTurret — turret prefabs
+            // 7. SimpleTurret — clone as DontDestroyOnLoad prefabs
             try
             {
                 var allTurrets = Resources.FindObjectsOfTypeAll<Il2CppTurret.SimpleTurret>();
                 for (int i = 0; i < (allTurrets?.Length ?? 0); i++)
                 {
-                    var rootGO = allTurrets[i].transform.root.gameObject;
-                    LoggerInstance.Msg($"[SCENE]   SimpleTurret: '{allTurrets[i].gameObject.name}' root='{rootGO.name}'");
-                    if (!cachedTurretPrefabs.Contains(rootGO))
+                    try
                     {
-                        cachedTurretPrefabs.Add(rootGO);
-                        found++;
+                        var turretGO = allTurrets[i].gameObject;
+                        // Walk up to find the self-contained turret unit (has a Targetable or is a named unit)
+                        var turretRoot = turretGO;
+                        var parent = turretGO.transform.parent;
+                        if (parent != null)
+                        {
+                            // Use parent if it looks like a turret container (not the scene root)
+                            var parentGO = parent.gameObject;
+                            if (parentGO.transform.parent != null) // not scene root
+                                turretRoot = parentGO;
+                        }
+                        string turretName = turretRoot.name;
+                        LoggerInstance.Msg($"[SCENE]   SimpleTurret: '{turretGO.name}' turretRoot='{turretName}' rootScene='{turretRoot.transform.root.gameObject.name}'");
+
+                        // Skip duplicates and already-cloned templates
+                        bool dup = false;
+                        foreach (var p in cachedTurretPrefabs) { if (p.name == "HS_Turret_" + turretName) { dup = true; break; } }
+                        if (dup) continue;
+
+                        var clone = CloneAsPrefabTemplate(turretRoot, "HS_Turret_" + turretName);
+                        if (clone != null)
+                        {
+                            cachedTurretPrefabs.Add(clone);
+                            found++;
+                        }
                     }
+                    catch (Exception ex) { LoggerInstance.Msg($"[SCENE]   Turret clone error: {ex.Message}"); }
                 }
             }
             catch { }
 
-            // 8. Scan all GameObjects for escort/enemy-named objects with AI
+            // 8. NavalShip — only clone actual warships (destroyers), not yachts/fishing boats
+            try
+            {
+                var allShips = Resources.FindObjectsOfTypeAll<Il2CppTargetableSystem.NavalShip>();
+                for (int i = 0; i < (allShips?.Length ?? 0); i++)
+                {
+                    try
+                    {
+                        var shipGO = allShips[i].gameObject;
+                        var shipRoot = shipGO.transform.root.gameObject;
+                        string shipName = shipGO.name;
+                        string rootName = shipRoot.name;
+                        LoggerInstance.Msg($"[SCENE]   NavalShip: '{shipName}' root='{rootName}'");
+
+                        // Clone the NavalShip's own gameobject — it IS the ship
+                        var cloneSource = shipGO;
+
+                        bool dup = false;
+                        string templateName = "HS_Ship_" + cloneSource.name;
+                        foreach (var p in cachedShipPrefabs) { if (p.name == templateName) { dup = true; break; } }
+                        if (dup) continue;
+
+                        var clone = CloneAsPrefabTemplate(cloneSource, templateName);
+                        if (clone != null)
+                        {
+                            cachedShipPrefabs.Add(clone);
+                            found++;
+                        }
+                    }
+                    catch (Exception ex) { LoggerInstance.Msg($"[SCENE]   Ship clone error: {ex.Message}"); }
+                }
+            }
+            catch { }
+
+            // 9. CombatVehicle / AdvancedCombatVehicle — tanks, AA, armed vehicles ONLY
+            try
+            {
+                var allCV = Resources.FindObjectsOfTypeAll<Il2CppTargetableSystem.CombatVehicle>();
+                for (int i = 0; i < (allCV?.Length ?? 0); i++)
+                {
+                    try
+                    {
+                        var vehGO = allCV[i].gameObject;
+                        string vehName = vehGO.name;
+
+                        // Skip our own clones, ambient/civilian vehicles, and fishing boats/yachts
+                        if (vehName.StartsWith("HS_")) continue;
+                        string vehLower = vehName.ToLower();
+                        if (vehLower.Contains("ambient") || vehLower.Contains("fishing") || vehLower.Contains("yacht") || vehLower.Contains("civilian")) continue;
+
+                        // Only cache if it has turrets (actual combat vehicle)
+                        var turrets = vehGO.GetComponentsInChildren<Il2CppTurret.SimpleTurret>(true);
+                        if (turrets == null || turrets.Length == 0) { LoggerInstance.Msg($"[SCENE]   CombatVehicle (no turrets, skip): '{vehName}'"); continue; }
+
+                        bool dup = false;
+                        string templateName = "HS_Vehicle_" + vehName;
+                        foreach (var p in cachedGroundVehicles) { if (p != null && p.name == templateName) { dup = true; break; } }
+                        if (dup) continue;
+
+                        LoggerInstance.Msg($"[SCENE]   CombatVehicle: '{vehName}' turrets={turrets.Length}");
+                        var clone = CloneAsPrefabTemplate(vehGO, templateName);
+                        if (clone != null)
+                        {
+                            cachedGroundVehicles.Add(clone);
+                            found++;
+                            LoggerInstance.Msg($"[SCENE]   *** CACHED ground vehicle: '{templateName}' ***");
+                        }
+                    }
+                    catch (Exception ex) { LoggerInstance.Msg($"[SCENE]   CombatVehicle error: {ex.Message}"); }
+                }
+            }
+            catch { }
+
+            // NOTE: Civilian vehicles (ConvoyVehicle without turrets) are NOT cloned — no moving ground assets needed
+
+            // 11. Scan all GameObjects for escort/enemy-named objects with AI
             try
             {
                 var allGO = Resources.FindObjectsOfTypeAll<GameObject>();
@@ -482,8 +675,55 @@ namespace UW2Mod
 
             if (found > 0)
             {
-                LoggerInstance.Msg($"[SCENE] === Cached {found} combat prefabs! enemyPrefabsReady={enemyPrefabsReady} ===");
+                LoggerInstance.Msg($"[SCENE] === Cached {found} combat prefabs! fighters={enemyPrefabsReady} turrets={cachedTurretPrefabs.Count} ships={cachedShipPrefabs.Count} vehicles={cachedGroundVehicles.Count} civilian={cachedCivilianVehicles.Count} ===");
                 combatPrefabsScanned = true;
+
+                // Update collection tracker
+                if (enemyPrefabsReady || cachedFighterPrefabs.Count > 0) hsHasFighters = true;
+                if (cachedTurretPrefabs.Count > 0) hsHasTurrets = true;
+                if (cachedShipPrefabs.Count > 0) hsHasShips = true;
+                if (cachedGroundVehicles.Count > 0) hsHasGroundVehicles = true;
+
+                // Check for full unlock
+                if (hsHasFighters && hsHasTurrets && hsHasShips && hsHasGroundVehicles && !hsFullyUnlocked)
+                {
+                    hsFullyUnlocked = true;
+                    LoggerInstance.Msg("[HS] *** ALL PREFAB CATEGORIES COLLECTED — HOSTILE SKIES FULLY UNLOCKED! ***");
+
+                    if (!hsUnlockNotified)
+                    {
+                        hsUnlockNotified = true;
+                        // Try using the game's toast/notification system
+                        try
+                        {
+                            var toasts = Resources.FindObjectsOfTypeAll<Il2Cpp.ToastMessageContentView>();
+                            if (toasts != null && toasts.Length > 0)
+                            {
+                                var toast = toasts[0];
+                                toast.SetMessageText("HOSTILE SKIES UNLOCKED\nFly to Queensland Regional to start");
+                                toast.SetContentActiveState(true);
+                                toast.StartCountdownForHiding(8);
+                                LoggerInstance.Msg("[HS] Unlock notification displayed via toast");
+                            }
+                            else
+                            {
+                                // Fallback to our status message
+                                SetStatus("HOSTILE SKIES UNLOCKED — Fly to Queensland Regional to start!");
+                            }
+                        }
+                        catch
+                        {
+                            SetStatus("HOSTILE SKIES UNLOCKED — Fly to Queensland Regional to start!");
+                        }
+                        SaveCombatState();
+                    }
+                }
+                else if (hsHasFighters && !hsFullyUnlocked)
+                {
+                    // Partial progress notification
+                    int collected = (hsHasFighters ? 1 : 0) + (hsHasTurrets ? 1 : 0) + (hsHasShips ? 1 : 0) + (hsHasGroundVehicles ? 1 : 0);
+                    LoggerInstance.Msg($"[HS] Prefab collection: {collected}/4 categories ({(hsHasFighters?"Fighters ":"")}{(hsHasTurrets?"Turrets ":"")}{(hsHasShips?"Ships ":"")}{(hsHasGroundVehicles?"Vehicles ":"")})");
+                }
 
                 // Save this scene info so we can auto-load it on next startup
                 if (enemyPrefabsReady && !string.IsNullOrEmpty(pendingSceneName) && pendingSceneName != savedCombatSceneName)
@@ -510,6 +750,7 @@ namespace UW2Mod
             else
             {
                 LoggerInstance.Msg($"[SCENE] === No combat prefabs in this scene ===");
+                combatPrefabsScanned = true; // mark done even if nothing found — prevents per-frame rescan
             }
         }
 
@@ -672,15 +913,15 @@ namespace UW2Mod
                 catch { }
             }
 
-            // === MENU TOGGLE: Spacebar, F1, or hold Left Menu button ===
+            // === MENU TOGGLE: Spacebar, F1, or hold Y button (left controller) for 1.5s ===
             bool toggleMenu = Input.GetKeyDown(KeyCode.Space) || Input.GetKeyDown(KeyCode.F1);
-            // Quest left menu button (Start) — hold for 0.5s to toggle (prevents accidental opens)
+            // Y button on left controller — hold for 1.5s to toggle (prevents accidental opens)
             try
             {
-                if (OVRInput.Get(OVRInput.Button.Start))
+                if (OVRInput.Get(OVRInput.Button.Two, OVRInput.Controller.LTouch)) // Y button
                 {
                     menuHoldTimer += Time.unscaledDeltaTime;
-                    if (menuHoldTimer >= 1.0f && !menuHoldTriggered)
+                    if (menuHoldTimer >= 1.5f && !menuHoldTriggered)
                     {
                         toggleMenu = true;
                         menuHoldTriggered = true;
@@ -832,6 +1073,23 @@ namespace UW2Mod
                 }
                 catch { }
 
+                // Cache player Rigidbody (invalidate if aircraft changed)
+                try
+                {
+                    var ac = GameManager.ControllerAircraft;
+                    if (ac != null && (cachedPlayerRb == null || cachedPlayerAircraftGO != ac.gameObject))
+                    {
+                        cachedPlayerAircraftGO = ac.gameObject;
+                        cachedPlayerRb = ac.gameObject.GetComponent<Rigidbody>();
+                    }
+                    else if (ac == null)
+                    {
+                        cachedPlayerRb = null;
+                        cachedPlayerAircraftGO = null;
+                    }
+                }
+                catch { }
+
                 // Anti-fall-through: detect aircraft falling below ground and rescue it
                 try
                 {
@@ -839,7 +1097,7 @@ namespace UW2Mod
                     if (ac != null)
                     {
                         string acName = ac.gameObject.name;
-                        var rb = ac.gameObject.GetComponent<Rigidbody>();
+                        var rb = cachedPlayerRb;
 
                         // Detect new aircraft spawn (name changed = new plane)
                         if (acName != lastKnownAircraftName)
@@ -848,7 +1106,11 @@ namespace UW2Mod
                             spawnProtectionActive = true;
                             spawnProtectionTimer = 0f;
                             hasSafePosition = false;
+                            playerBaseHP = -1f; // reset so upgrades re-cache original HP
+                            cachedSecondaryFM = null; // reset secondary weapon cache for new aircraft
                             LoggerInstance.Msg($"[SPAWN] New aircraft detected: '{acName}' — spawn protection ON");
+                            try { ApplyUpgrades(); } catch { }
+                            // Enemy prefabs load on-demand when player activates Hostile Skies (not here — additive scene load during game state transition causes crash)
                         }
 
                         if (spawnProtectionActive)
@@ -984,7 +1246,7 @@ namespace UW2Mod
                         var ac = GameManager.ControllerAircraft;
                         if (ac != null)
                         {
-                            var rb = ac.gameObject.GetComponent<Rigidbody>();
+                            var rb = cachedPlayerRb;
                             if (rb != null)
                             {
                                 float d = rb.drag;
@@ -999,6 +1261,25 @@ namespace UW2Mod
                 }
                 catch { }
 
+                // === Speed Preset System (overrides manual power/drag when HS active) ===
+                try
+                {
+                    if (hostileSkiesActive && activeSpeedPreset > 0 && !landingMode)
+                    {
+                        enginePowerMultiplier = speedPresetPower[activeSpeedPreset];
+                        dragMultiplier = speedPresetDrag[activeSpeedPreset];
+                        continuousBoost = speedPresetBoost[activeSpeedPreset];
+                    }
+                    if (landingMode)
+                    {
+                        continuousBoost = 0;
+                        enginePowerMultiplier = Math.Min(enginePowerMultiplier, 1.5f);
+                        // Slightly increase drag for easier approach
+                        dragMultiplier = Math.Max(dragMultiplier, 1.2f);
+                    }
+                }
+                catch { }
+
                 // Continuous boost (separate try so it doesn't break other effects)
                 try
                 {
@@ -1007,15 +1288,14 @@ namespace UW2Mod
                         var ac = GameManager.ControllerAircraft;
                         if (ac != null)
                         {
-                            var rb = ac.gameObject.GetComponent<Rigidbody>();
+                            var rb = cachedPlayerRb;
                             if (rb != null) rb.AddForce(ac.transform.forward * continuousBoost * Time.deltaTime, ForceMode.Force);
                         }
                     }
                 }
                 catch { }
 
-                // Anti-pitch compensation — counteracts nose-up torque from boosted thrust
-                // Only active when engine power is modded or boost is on (stock flight unaffected)
+                // Anti-pitch compensation — improved with preventive trim + reactive damping
                 try
                 {
                     if (enginePowerMultiplier > 1f || continuousBoost > 0)
@@ -1023,21 +1303,47 @@ namespace UW2Mod
                         var ac = GameManager.ControllerAircraft;
                         if (ac != null)
                         {
-                            var rb = ac.gameObject.GetComponent<Rigidbody>();
+                            var rb = cachedPlayerRb;
                             if (rb != null)
                             {
-                                // Get current pitch rate (angular velocity around the right axis)
+                                // Calculate excess thrust factor
+                                float excessFactor = 0f;
+                                if (enginePowerMultiplier > 1f) excessFactor += (enginePowerMultiplier - 1f);
+                                if (continuousBoost > 0) excessFactor += continuousBoost / 10000f;
+
+                                // Get anti-pitch strength from preset (or calculate from manual settings)
+                                float antiPitchStr = 0f;
+                                if (hostileSkiesActive && activeSpeedPreset > 0)
+                                    antiPitchStr = speedPresetAntiPitch[activeSpeedPreset];
+                                else
+                                    antiPitchStr = excessFactor * 1.5f;
+                                antiPitchStr = Math.Min(antiPitchStr, 10f);
+
+                                // Part A: Preventive trim — constant nose-down proportional to throttle and excess
+                                float throttle = 0f;
+                                try
+                                {
+                                    var engines = ac.m_aircraftEngines;
+                                    if (engines != null && engines.Count > 0)
+                                    {
+                                        var eng = engines[0]?.TryCast<AircraftEngine>();
+                                        if (eng != null) throttle = eng.m_normalizedRPM;
+                                    }
+                                }
+                                catch { }
+
+                                if (throttle > 0.1f)
+                                {
+                                    float trimForce = antiPitchStr * throttle * rb.mass * 0.2f;
+                                    rb.AddTorque(-ac.transform.right * trimForce, ForceMode.Force);
+                                }
+
+                                // Part B: Reactive damping — fight existing pitch-up rate
                                 float pitchRate = Vector3.Dot(rb.angularVelocity, ac.transform.right);
-                                // Only correct nose-UP pitch (positive pitch rate = nose going up)
                                 if (pitchRate > 0.01f)
                                 {
-                                    // Scale correction with how much we've boosted
-                                    float correctionStrength = 0f;
-                                    if (enginePowerMultiplier > 1f) correctionStrength += (enginePowerMultiplier - 1f) * 1.5f;
-                                    if (continuousBoost > 0) correctionStrength += continuousBoost * 0.0002f;
-                                    correctionStrength = Math.Min(correctionStrength, 10f); // cap it
-                                    // Apply nose-down torque proportional to pitch-up rate
-                                    rb.AddTorque(-ac.transform.right * pitchRate * correctionStrength * rb.mass, ForceMode.Force);
+                                    float dampingForce = pitchRate * antiPitchStr * 1.5f * rb.mass;
+                                    rb.AddTorque(-ac.transform.right * dampingForce, ForceMode.Force);
                                 }
                             }
                         }
@@ -1061,7 +1367,7 @@ namespace UW2Mod
                                 if (eng != null) engineOn = eng.m_currentRPM > eng.m_idleRPM * 0.5f;
                             }
 
-                            var rb = ac.gameObject.GetComponent<Rigidbody>();
+                            var rb = cachedPlayerRb;
                             float vel = rb != null ? rb.velocity.magnitude : 0;
 
                             if (wasEngineOn && !engineOn && vel > 10f)
@@ -1105,6 +1411,9 @@ namespace UW2Mod
 
                 // Hostile Skies — zone-based combat encounters
                 try { UpdateHostileSkies(); } catch { }
+
+                // Left trigger = secondary weapon (grenades) — Ace Combat style
+                try { UpdateSecondaryWeapon(); } catch { }
 
                 // Telemetry logging (when HUD is active, log flight data periodically for post-session analysis)
                 if (showHUD)
@@ -1868,11 +2177,36 @@ namespace UW2Mod
 
             // Hostile Skies
             wristItems.Add(new WristItem {
-                DynamicLabel = () => "Hostile Skies: " + (hostileSkiesActive ? "ON" : "OFF"),
+                DynamicLabel = () => "Hostile Skies: " + (hostileSkiesActive ? hsStateNames[Math.Min(hsState, hsStateNames.Length - 1)] : "OFF"),
                 OnActivate = () => {
                     hostileSkiesActive = !hostileSkiesActive;
-                    if (!hostileSkiesActive) { ClearCombatants(); combatModeName = "OFF"; combatSpawnInterval = 0; }
-                    SetStatus(hostileSkiesActive ? "Hostile Skies ACTIVE!" : "Hostile Skies OFF");
+                    if (hostileSkiesActive)
+                    {
+                        if (!enemyPrefabsReady && cachedFighterPrefabs.Count == 0)
+                        {
+                            // Try loading — show toast while waiting
+                            if (!string.IsNullOrEmpty(savedCombatSceneName) && savedCombatSceneIndex > 0)
+                            {
+                                hostileSkiesActive = false;
+                                ShowGameToast("HOSTILE SKIES\nLoading combat assets...\nPlease wait a moment", 6);
+                                try { LoadEnemyPrefabs(); } catch { }
+                                return;
+                            }
+                            hostileSkiesActive = false;
+                            ShowGameToast("HOSTILE SKIES\nPlay a combat mission first to unlock", 5);
+                            return;
+                        }
+                        hsState = HS_INACTIVE; // will transition to ROAMING on first update
+                        sessionKills = 0;
+                        ShowGameToast("HOSTILE SKIES ACTIVE\nEnemies will engage near combat zones", 5);
+                    }
+                    else
+                    {
+                        hsState = HS_INACTIVE;
+                        ClearCombatants(); combatModeName = "OFF"; combatSpawnInterval = 0;
+                        StopHSMusic();
+                        ShowGameToast("HOSTILE SKIES DEACTIVATED", 3);
+                    }
                 }
             });
             wristItems.Add(new WristItem {
@@ -1887,8 +2221,27 @@ namespace UW2Mod
                 }
             });
             wristItems.Add(new WristItem {
-                DynamicLabel = () => "Kills: " + totalKills + " | Streak: " + killStreak + " | Best: " + bestStreak,
-                OnActivate = () => { SetStatus("Session: " + sessionKills + " | Total: " + totalKills + " | Islands: " + islandsDiscovered); }
+                DynamicLabel = () => $"Scrap: {scrap} | Kills: {totalKills} | Streak: {killStreak}",
+                OnActivate = () => { SetStatus($"Session: {sessionKills} | Total: {totalKills} | Scrap: {scrap} | Islands: {islandsDiscovered}"); }
+            });
+            wristItems.Add(new WristItem {
+                DynamicLabel = () => hsState == HS_ENGAGEMENT ? $"FIGHTING — Wave {currentWave}/{totalWaves}" : "Start Engagement",
+                OnActivate = () => { HSManualStartEngagement(); }
+            });
+            wristItems.Add(new WristItem {
+                DynamicLabel = () => "Speed: " + speedPresetNames[Math.Min(activeSpeedPreset, speedPresetNames.Length - 1)],
+                OnActivate = () => {
+                    int maxPreset = Math.Min(upgradeSpeed + 1, speedPresetNames.Length); // unlock presets with speed upgrade
+                    activeSpeedPreset = (activeSpeedPreset + 1) % maxPreset;
+                    SetStatus($"Speed: {speedPresetNames[activeSpeedPreset]}");
+                }
+            });
+            wristItems.Add(new WristItem {
+                DynamicLabel = () => "Landing Mode: " + (landingMode ? "ON" : "OFF"),
+                OnActivate = () => {
+                    landingMode = !landingMode;
+                    SetStatus(landingMode ? "Landing Mode ON — reduced power, more control" : "Landing Mode OFF");
+                }
             });
 
             // Battle modes (instant action)
@@ -2296,6 +2649,7 @@ namespace UW2Mod
             if (showHUD && initialized && !showMenu)
             {
                 try { RenderHUD(); } catch { }
+                try { RenderCombatHUD(); } catch { }
             }
 
             if (!showMenu) return;
@@ -2424,6 +2778,78 @@ namespace UW2Mod
             sHudHeader = new GUIStyle(GUI.skin.label) { fontSize = 11, padding = new RectOffset(4, 4, 0, 0) };
             sHudHeader.normal.textColor = new Color(0.3f, 0.85f, 1f, 1f);
             hudStylesInit = true;
+        }
+
+        private void RenderCombatHUD()
+        {
+            if (!hostileSkiesActive || hsState == HS_INACTIVE) return;
+            InitHudStyles();
+
+            float x = 15, y = 15, w = 280, lineH = 18, pad = 4;
+            float totalH = lineH * 8 + pad * 2;
+
+            // Semi-transparent background
+            var oldColor = GUI.color;
+            GUI.color = new Color(0, 0, 0, 0.7f);
+            GUI.Box(new Rect(x, y, w, totalH), "");
+            GUI.color = oldColor;
+
+            float rowY = y + pad;
+
+            // Title
+            GUI.Label(new Rect(x + pad, rowY, w, lineH), "HOSTILE SKIES", sHudHeader);
+            rowY += lineH;
+
+            // Threat level
+            string stars = new string('*', threatLevel) + new string('-', 5 - threatLevel);
+            GUI.Label(new Rect(x + pad, rowY, 90, lineH), "THREAT:", sHudLabel);
+            GUI.Label(new Rect(x + 90, rowY, w - 90, lineH), $"[{stars}]", sHudValue);
+            rowY += lineH;
+
+            // State + Wave info
+            if (hsState == HS_ENGAGEMENT)
+            {
+                GUI.Label(new Rect(x + pad, rowY, 90, lineH), "WAVE:", sHudLabel);
+                GUI.Label(new Rect(x + 90, rowY, w - 90, lineH), $"{currentWave}/{totalWaves}  ENEMIES: {currentWaveEnemies.Count}", sHudValue);
+            }
+            else if (hsState == HS_WAVE_COMPLETE)
+            {
+                int countdown = Math.Max(0, (int)(WAVE_COMPLETE_PAUSE - hsStateTimer));
+                GUI.Label(new Rect(x + pad, rowY, w, lineH), currentWave < totalWaves ? $"Next wave in {countdown}s..." : "ENGAGEMENT COMPLETE!", sHudValue);
+            }
+            else
+            {
+                GUI.Label(new Rect(x + pad, rowY, 90, lineH), "STATUS:", sHudLabel);
+                GUI.Label(new Rect(x + 90, rowY, w - 90, lineH), hsStateNames[Math.Min(hsState, hsStateNames.Length - 1)], sHudValue);
+            }
+            rowY += lineH;
+
+            // Streak
+            GUI.Label(new Rect(x + pad, rowY, 90, lineH), "STREAK:", sHudLabel);
+            var prevCol = sHudValue.normal.textColor;
+            if (killStreak >= 5) sHudValue.normal.textColor = new Color(1f, 0.8f, 0.2f);
+            if (killStreak >= 10) sHudValue.normal.textColor = new Color(1f, 0.3f, 0.2f);
+            GUI.Label(new Rect(x + 90, rowY, w - 90, lineH), $"{killStreak}", sHudValue);
+            sHudValue.normal.textColor = prevCol;
+            rowY += lineH;
+
+            // Scrap
+            GUI.Label(new Rect(x + pad, rowY, 90, lineH), "SCRAP:", sHudLabel);
+            GUI.Label(new Rect(x + 90, rowY, w - 90, lineH), scrap.ToString("N0"), sHudValue);
+            rowY += lineH;
+
+            // Speed preset
+            GUI.Label(new Rect(x + pad, rowY, 90, lineH), "SPEED:", sHudLabel);
+            GUI.Label(new Rect(x + 90, rowY, w - 90, lineH), speedPresetNames[activeSpeedPreset] + (landingMode ? " [LANDING]" : ""), sHudValue);
+            rowY += lineH;
+
+            // Active enemies
+            GUI.Label(new Rect(x + pad, rowY, 90, lineH), "ACTIVE:", sHudLabel);
+            GUI.Label(new Rect(x + 90, rowY, w - 90, lineH), $"{combatActiveFighters} hostiles", sHudValue);
+            rowY += lineH;
+
+            // Session kills
+            GUI.Label(new Rect(x + pad, rowY, w, lineH), $"Session: {sessionKills} kills | Total: {totalKills}", sHudHeader);
         }
 
         private void RenderHUD()
@@ -2853,6 +3279,88 @@ namespace UW2Mod
 
         private void BuildCombat()
         {
+            // === HOSTILE SKIES STATUS ===
+            string hsStatus = hostileSkiesActive ? hsStateNames[Math.Min(hsState, hsStateNames.Length - 1)] : "OFF";
+            string threatStars = new string('*', threatLevel) + new string('-', 5 - threatLevel);
+            H($"=== HOSTILE SKIES [{hsStatus}] | Threat [{threatStars}] ===");
+            H($"  Scrap: {scrap} | Kills: {totalKills} | Streak: {killStreak} | Best: {bestStreak}");
+            if (hsState == HS_ENGAGEMENT)
+                H($"  Wave {currentWave}/{totalWaves} | Enemies: {currentWaveEnemies.Count} remaining");
+
+            B(hostileSkiesActive ? "DEACTIVATE Hostile Skies" : "ACTIVATE Hostile Skies", () => {
+                hostileSkiesActive = !hostileSkiesActive;
+                if (hostileSkiesActive)
+                {
+                    if (!enemyPrefabsReady && cachedFighterPrefabs.Count == 0)
+                    {
+                        if (!string.IsNullOrEmpty(savedCombatSceneName) && savedCombatSceneIndex > 0)
+                        {
+                            hostileSkiesActive = false;
+                            ShowGameToast("HOSTILE SKIES\nLoading combat assets...\nPlease wait a moment", 6);
+                            try { LoadEnemyPrefabs(); } catch { }
+                            return;
+                        }
+                        hostileSkiesActive = false;
+                        ShowGameToast("HOSTILE SKIES\nPlay a combat mission first to unlock", 5);
+                        return;
+                    }
+                    hsState = HS_INACTIVE;
+                    sessionKills = 0;
+                    ShowGameToast("HOSTILE SKIES ACTIVE\nEnemies will engage near combat zones", 5);
+                }
+                else
+                {
+                    hsState = HS_INACTIVE;
+                    ClearCombatants(); combatModeName = "OFF"; combatSpawnInterval = 0;
+                    StopHSMusic();
+                    ShowGameToast("HOSTILE SKIES DEACTIVATED", 3);
+                }
+            });
+            B($"Threat Level: {threatLevel} [{threatStars}]", () => {
+                threatLevel++;
+                if (threatLevel > threatLevelUnlocked) threatLevel = 1;
+                SetStatus($"Threat Level {threatLevel}");
+            });
+            if (hsState == HS_ROAMING || hsState == HS_INACTIVE)
+                B("Start Engagement NOW", () => { HSManualStartEngagement(); });
+            if (hsState == HS_DEFEATED)
+                B("Continue (back to roaming)", () => { hsState = HS_ROAMING; hsStateTimer = 0f; SetStatus("Back in action!"); });
+
+            // === UPGRADES SHOP ===
+            H($"--- UPGRADES (Scrap: {scrap}) ---");
+            string UpgradeLabel(string name, int tier) {
+                string bar = new string('>', tier) + new string('-', 4 - tier);
+                string cost = tier >= 4 ? "MAX" : $"{UPGRADE_COSTS[tier]} scrap";
+                return $"{name} [{bar}] Tier {tier}/4 — {cost}";
+            }
+            B(UpgradeLabel("Armor (+25% HP)", upgradeArmor), () => {
+                int temp = upgradeArmor; TryPurchaseUpgrade(ref upgradeArmor, "Armor");
+            });
+            B(UpgradeLabel("Fire Rate (-15% cooldown)", upgradeFireRate), () => {
+                int temp = upgradeFireRate; TryPurchaseUpgrade(ref upgradeFireRate, "Fire Rate");
+            });
+            B(UpgradeLabel("Ammo Capacity (+50%)", upgradeAmmoCapacity), () => {
+                int temp = upgradeAmmoCapacity; TryPurchaseUpgrade(ref upgradeAmmoCapacity, "Ammo Capacity");
+            });
+            B(UpgradeLabel("Speed (+20% power)", upgradeSpeed), () => {
+                int temp = upgradeSpeed; TryPurchaseUpgrade(ref upgradeSpeed, "Speed");
+            });
+            B(UpgradeLabel("Handling (+15% response)", upgradeHandling), () => {
+                int temp = upgradeHandling; TryPurchaseUpgrade(ref upgradeHandling, "Handling");
+            });
+
+            // === SPEED PRESET ===
+            H($"--- SPEED: {speedPresetNames[activeSpeedPreset]} | Landing: {(landingMode ? "ON" : "OFF")} ---");
+            B($"Speed Preset: {speedPresetNames[activeSpeedPreset]}", () => {
+                int maxPreset = Math.Min(upgradeSpeed + 1, speedPresetNames.Length);
+                activeSpeedPreset = (activeSpeedPreset + 1) % maxPreset;
+                SetStatus($"Speed: {speedPresetNames[activeSpeedPreset]}");
+            });
+            B($"Landing Mode: {(landingMode ? "ON" : "OFF")}", () => {
+                landingMode = !landingMode;
+                SetStatus(landingMode ? "Landing Mode ON" : "Landing Mode OFF");
+            });
+
             H("--- WEAPONS ---");
             B("Force Spawn All Weapons", () => {
                 try
@@ -3015,6 +3523,164 @@ namespace UW2Mod
                     SpawnEnemyFighter(ac.transform.position + offset + Vector3.up * UnityEngine.Random.Range(0f, 80f));
                 }
             });
+            H($"--- GROUND/NAVAL (turrets: {cachedTurretPrefabs.Count} | ships: {cachedShipPrefabs.Count}) ---");
+            B("Spawn Ground Turret", () => {
+                if (cachedTurretPrefabs.Count == 0) { SetStatus("No turret prefabs — play a combat mission with turrets first"); return; }
+                var ac = GameManager.ControllerAircraft;
+                if (ac == null) { SetStatus("Not in aircraft"); return; }
+                // Try up to 5 random positions to find land (above sea level)
+                for (int attempt = 0; attempt < 5; attempt++)
+                {
+                    float angle = UnityEngine.Random.Range(0f, 360f);
+                    float dist = UnityEngine.Random.Range(300f, 600f);
+                    Vector3 offset = Quaternion.Euler(0, angle, 0) * Vector3.forward * dist;
+                    Vector3 testPos = ac.transform.position + offset;
+                    RaycastHit hit;
+                    if (Physics.Raycast(new Vector3(testPos.x, 2000f, testPos.z), Vector3.down, out hit, 3000f))
+                    {
+                        if (hit.point.y > 1f) // above water — this is land
+                        {
+                            SpawnGroundTurret(hit.point + Vector3.up * 1f);
+                            return;
+                        }
+                    }
+                }
+                SetStatus("Couldn't find land nearby — fly over an island");
+            });
+            B("Spawn Destroyer", () => {
+                // Find a destroyer specifically, not civilian boats
+                GameObject destroyer = null;
+                foreach (var ship in cachedShipPrefabs)
+                {
+                    if (ship == null) continue;
+                    string n = ship.name.ToLower();
+                    if (n.Contains("destroyer") || n.Contains("warship") || n.Contains("frigate") || n.Contains("cruiser"))
+                    { destroyer = ship; break; }
+                }
+                if (destroyer == null) { SetStatus("No destroyer cached — play a naval combat mission first"); return; }
+                var ac = GameManager.ControllerAircraft;
+                if (ac == null) { SetStatus("Not in aircraft"); return; }
+                // Try up to 5 random positions to find water (at or below sea level)
+                Vector3 spawnPos = Vector3.zero;
+                bool foundWater = false;
+                for (int attempt = 0; attempt < 5; attempt++)
+                {
+                    float angle = UnityEngine.Random.Range(0f, 360f);
+                    float dist = UnityEngine.Random.Range(400f, 800f);
+                    Vector3 offset = Quaternion.Euler(0, angle, 0) * Vector3.forward * dist;
+                    Vector3 testPos = ac.transform.position + offset;
+                    testPos.y = 0f;
+                    RaycastHit hit;
+                    // Check if there's land here — raycast down from high up
+                    if (Physics.Raycast(new Vector3(testPos.x, 2000f, testPos.z), Vector3.down, out hit, 3000f))
+                    {
+                        if (hit.point.y <= 1f) // at or below sea level — this is water
+                        {
+                            spawnPos = testPos;
+                            foundWater = true;
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        // No hit at all — open ocean
+                        spawnPos = testPos;
+                        foundWater = true;
+                        break;
+                    }
+                }
+                if (!foundWater) { SetStatus("Couldn't find water nearby — fly over the ocean"); return; }
+                spawnPos.y = 0f; // sea level
+                // Use the destroyer directly
+                try
+                {
+                    var clone = UnityEngine.Object.Instantiate(destroyer);
+                    clone.name = "HS_Destroyer_" + UnityEngine.Random.Range(1000, 9999);
+                    clone.transform.position = spawnPos;
+                    Vector3 lookDir = ac.transform.position - spawnPos; lookDir.y = 0;
+                    if (lookDir.sqrMagnitude > 0.01f) clone.transform.rotation = Quaternion.LookRotation(lookDir);
+                    clone.SetActive(true);
+                    var rb = clone.GetComponent<Rigidbody>();
+                    if (rb != null) rb.isKinematic = true;
+
+                    // Get player targeting refs
+                    Il2CppActor.ITargetable playerITargetable = null;
+                    Il2CppActor.Targetable playerTargetable = null;
+                    try { playerITargetable = ac.TryCast<Il2CppActor.ITargetable>(); } catch { }
+                    try { playerTargetable = ac.gameObject.GetComponentInChildren<Il2CppActor.Targetable>(true); } catch { }
+
+                    // Activate and configure turrets to target the player
+                    var turrets = clone.GetComponentsInChildren<Il2CppTurret.SimpleTurret>(true);
+                    LoggerInstance.Msg($"[COMBAT] Destroyer turrets: {turrets?.Length ?? 0}");
+                    for (int t = 0; t < (turrets?.Length ?? 0); t++)
+                    {
+                        var turret = turrets[t];
+                        turret.gameObject.SetActive(true);
+
+                        // Set target transform — this is what the turret tracks
+                        // Set target to player's Targetable component
+                        try { turret.m_target = playerTargetable; LoggerInstance.Msg($"[COMBAT]   Turret[{t}] m_target = player Targetable"); } catch (Exception ex) { LoggerInstance.Msg($"[COMBAT]   Turret[{t}] m_target set failed: {ex.Message}"); }
+
+                        // Set alertness to max so it engages immediately
+                        try { turret.m_alertness = 1f; } catch { }
+
+                        // Start the targeting readiness routine if not running
+                        try
+                        {
+                            if (turret.m_targetReadinessRoutine == null)
+                            {
+                                turret.StartCoroutine(turret.TargetReadinessRoutine(true));
+                                LoggerInstance.Msg($"[COMBAT]   Turret[{t}] TargetReadinessRoutine started");
+                            }
+                        }
+                        catch (Exception ex) { LoggerInstance.Msg($"[COMBAT]   Turret[{t}] TargetReadinessRoutine failed: {ex.Message}"); }
+
+                        // Start the line-of-sight check routine
+                        try
+                        {
+                            turret.StartCoroutine(turret.LineOfSightCheckRoutine());
+                            LoggerInstance.Msg($"[COMBAT]   Turret[{t}] LineOfSightCheckRoutine started");
+                        }
+                        catch (Exception ex) { LoggerInstance.Msg($"[COMBAT]   Turret[{t}] LineOfSightCheck failed: {ex.Message}"); }
+
+                        // Draw attention to force alert/attack state
+                        try
+                        {
+                            turret.StartCoroutine(turret.DrawAttentionRoutine((Il2CppTurret.SimpleTurret.Attention)4, 0f));
+                            LoggerInstance.Msg($"[COMBAT]   Turret[{t}] DrawAttentionRoutine(Attack) started");
+                        }
+                        catch (Exception ex) { LoggerInstance.Msg($"[COMBAT]   Turret[{t}] DrawAttention failed: {ex.Message}"); }
+
+                        LoggerInstance.Msg($"[COMBAT]   Turret[{t}]: target={turret.m_target != null} alertness={turret.m_alertness} attention={turret.m_currentAttention} allowAttack={turret.m_allowedToAttack}");
+                    }
+
+                    // Activate AI weapons
+                    var aiWeapons = clone.GetComponentsInChildren<Il2CppAi.AiAircraftWeapon>(true);
+                    for (int w = 0; w < (aiWeapons?.Length ?? 0); w++)
+                    {
+                        aiWeapons[w].IsActive = true;
+                        aiWeapons[w].gameObject.SetActive(true);
+                        if (playerITargetable != null) try { aiWeapons[w].CurrentTarget = playerITargetable; } catch { }
+                    }
+
+                    // Enable firing mechanisms
+                    var fms = clone.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(true);
+                    for (int f = 0; f < (fms?.Length ?? 0); f++)
+                    {
+                        fms[f].gameObject.SetActive(true);
+                        fms[f].m_isEnabled = true;
+                        var fm = fms[f].TryCast<Il2CppWeapon.FiringMechanism>();
+                        if (fm != null) fm.m_isInfiniteAmmo = true;
+                    }
+
+                    spawnedCombatants.Add(clone);
+                    combatActiveFighters = spawnedCombatants.Count;
+                    LoggerInstance.Msg($"[COMBAT] Destroyer spawned: turrets={turrets?.Length ?? 0} aiWeapons={aiWeapons?.Length ?? 0} fms={fms?.Length ?? 0}");
+                    SetStatus($"Destroyer spawned! ({combatActiveFighters} active)");
+                }
+                catch (Exception ex) { SetStatus($"Destroyer spawn failed: {ex.Message}"); LoggerInstance.Error($"[COMBAT] Destroyer: {ex}"); }
+            });
+
             B("DEEP SCAN: Everything Combat", () => {
                 try
                 {
@@ -3281,6 +3947,8 @@ namespace UW2Mod
             cachedFighterPrefabs.Clear();
             cachedTurretPrefabs.Clear();
             cachedShipPrefabs.Clear();
+            cachedGroundVehicles.Clear();
+            cachedCivilianVehicles.Clear();
 
             LoggerInstance.Msg("=== COMBAT PREFAB SCAN ===");
 
@@ -3521,8 +4189,15 @@ namespace UW2Mod
                 catch (Exception ex) { LoggerInstance.Msg($"[COMBAT] Spawner attempt: {ex.Message}"); }
             }
 
+            // Include scene-hook prefabs if available (these are the reliable ones)
+            if (cachedFighterPrefabs.Count == 0 && enemyPrefabsReady)
+            {
+                if (IsValidCachedPrefab(cachedEnemyMesser)) { cachedFighterPrefabs.Add(cachedEnemyMesser); LoggerInstance.Msg("[COMBAT] Added scene-hook messer to fighter prefabs"); }
+                if (IsValidCachedPrefab(cachedEnemyWolf)) { cachedFighterPrefabs.Add(cachedEnemyWolf); LoggerInstance.Msg("[COMBAT] Added scene-hook wolf to fighter prefabs"); }
+            }
+
             combatPrefabsScanned = true;
-            LoggerInstance.Msg($"[COMBAT] Scan complete: {cachedFighterPrefabs.Count} fighters, {cachedTurretPrefabs.Count} turrets, {cachedShipPrefabs.Count} ships");
+            LoggerInstance.Msg($"[COMBAT] Scan complete: {cachedFighterPrefabs.Count} fighters, {cachedTurretPrefabs.Count} turrets, {cachedShipPrefabs.Count} ships (sceneHook={enemyPrefabsReady})");
             SetStatus($"Found {cachedFighterPrefabs.Count} fighters, {cachedTurretPrefabs.Count} turrets, {cachedShipPrefabs.Count} ships");
         }
 
@@ -3651,6 +4326,25 @@ namespace UW2Mod
             if (enemyPrefabsReady) { SetStatus($"Prefabs already loaded! messer={cachedEnemyMesser != null} wolf={cachedEnemyWolf != null}"); return; }
 
             LoggerInstance.Msg("[COMBAT] === LOADING ENEMY PREFABS ===");
+
+            // PRIORITY: If we have a saved combat scene, load it additively — this is the reliable method
+            if (!string.IsNullOrEmpty(savedCombatSceneName) && savedCombatSceneIndex > 0)
+            {
+                LoggerInstance.Msg($"[COMBAT] Loading saved combat scene '{savedCombatSceneName}' (index={savedCombatSceneIndex}) additively...");
+                combatSceneAutoLoaded = true;
+                try
+                {
+                    UnityEngine.SceneManagement.SceneManager.LoadScene(savedCombatSceneIndex, UnityEngine.SceneManagement.LoadSceneMode.Additive);
+                    SetStatus("Loading combat assets... ready in a few seconds");
+                    return; // scene hook will fire ScanSceneForEnemyPrefabs when loaded
+                }
+                catch (Exception ex)
+                {
+                    LoggerInstance.Msg($"[COMBAT] Additive scene load failed: {ex.Message}");
+                    combatSceneAutoLoaded = false;
+                    // Fall through to other methods
+                }
+            }
 
             // STEP 1: Check if ScanCombatPrefabs already cached them from a callback
             if (cachedEnemyMesser != null || cachedEnemyWolf != null)
@@ -3902,14 +4596,46 @@ namespace UW2Mod
                 }
                 catch { }
 
+                // === Tweak AI config for aggressive combat ===
+                try
+                {
+                    var aiCtrlForConfig = clone.GetComponentInChildren<Il2CppAi.AiAircraftController>(true);
+                    if (aiCtrlForConfig != null)
+                    {
+                        // Make attack config more aggressive
+                        var atkConfig = aiCtrlForConfig.m_aiAircraftConfigAttack;
+                        if (atkConfig != null)
+                        {
+                            atkConfig.m_canLoseLineOfSite = false; // never lose track of player
+                            atkConfig.m_outOfSightAngle = 360f;   // detect player from any angle
+                            atkConfig.m_outOfSightTime = 0.5f;    // re-acquire almost instantly
+                            atkConfig.m_outOfSightDistance = 2000f; // track from 2km
+                            atkConfig.m_leadTarget = true;          // lead shots
+                            atkConfig.m_onDamageResumeAttack = 0.1f; // resume attack immediately after hit
+                            atkConfig.m_maxPitchAngle = 80f;       // steep attack dives
+                            atkConfig.m_maxRollAngle = 90f;        // aggressive banking
+                            LoggerInstance.Msg("[COMBAT]   Attack config tuned for aggressive combat");
+                        }
+                        // Also tune patrol config so they're aggressive even in patrol state
+                        var patrolConfig = aiCtrlForConfig.m_aiAircraftConfigPatrol;
+                        if (patrolConfig != null)
+                        {
+                            patrolConfig.m_canLoseLineOfSite = false;
+                            patrolConfig.m_outOfSightAngle = 360f;
+                            patrolConfig.m_outOfSightDistance = 2000f;
+                        }
+                    }
+                }
+                catch (Exception ex) { LoggerInstance.Msg($"[COMBAT]   AI config tweak: {ex.Message}"); }
+
                 // === Enable rigidbody and give initial velocity ===
                 var rb = clone.GetComponent<Rigidbody>();
                 if (rb != null)
                 {
                     rb.isKinematic = false;
                     rb.useGravity = false;
-                    rb.velocity = clone.transform.forward * 40f;
-                    LoggerInstance.Msg($"[COMBAT]   Rigidbody: mass={rb.mass} drag={rb.drag} velocity set");
+                    rb.velocity = clone.transform.forward * 70f; // ~140 knots — fast approach
+                    LoggerInstance.Msg($"[COMBAT]   Rigidbody: mass={rb.mass} drag={rb.drag} velocity set (70m/s)");
                 }
 
                 // === Enable all FiringMechanisms with infinite ammo ===
@@ -3936,6 +4662,196 @@ namespace UW2Mod
             {
                 LoggerInstance.Error($"[COMBAT] SpawnEnemyFighter: {ex}");
                 SetStatus($"Spawn failed: {ex.Message}");
+            }
+        }
+
+        // ================================================================
+        // GROUND TURRET SPAWNING
+        // ================================================================
+        private void SpawnGroundTurret(Vector3 spawnPos)
+        {
+            if (cachedTurretPrefabs.Count == 0) { SetStatus("No turret prefabs — play a combat mission first"); return; }
+
+            try
+            {
+                var ac = GameManager.ControllerAircraft;
+                if (ac == null) { SetStatus("Not in aircraft"); return; }
+
+                var prefab = cachedTurretPrefabs[UnityEngine.Random.Range(0, cachedTurretPrefabs.Count)];
+                LoggerInstance.Msg($"[COMBAT] SpawnGroundTurret using '{prefab.name}'");
+
+                var clone = UnityEngine.Object.Instantiate(prefab);
+                clone.name = "HS_Turret_" + UnityEngine.Random.Range(1000, 9999);
+                clone.transform.position = spawnPos;
+                // Face toward player
+                Vector3 lookDir = ac.transform.position - spawnPos;
+                lookDir.y = 0; // keep turret level
+                if (lookDir.sqrMagnitude > 0.01f)
+                    clone.transform.rotation = Quaternion.LookRotation(lookDir);
+                clone.SetActive(true);
+
+                // Rigidbody — turrets sit on the ground, should be kinematic or gravity-on
+                var rb = clone.GetComponent<Rigidbody>();
+                if (rb != null)
+                {
+                    rb.isKinematic = true; // ground turret, don't move
+                    LoggerInstance.Msg($"[COMBAT]   Rigidbody set kinematic");
+                }
+
+                // Get player target ref
+                Il2CppActor.ITargetable playerITargetable = null;
+                try { playerITargetable = ac.TryCast<Il2CppActor.ITargetable>(); } catch { }
+
+                // Activate turrets and set them to target the player
+                try
+                {
+                    var turrets = clone.GetComponentsInChildren<Il2CppTurret.SimpleTurret>(true);
+                    LoggerInstance.Msg($"[COMBAT]   SimpleTurrets on clone: {turrets?.Length ?? 0}");
+                    for (int t = 0; t < (turrets?.Length ?? 0); t++)
+                    {
+                        var turret = turrets[t];
+                        turret.gameObject.SetActive(true);
+                        Il2CppActor.Targetable playerTargetable2 = null;
+                        try { playerTargetable2 = ac.gameObject.GetComponentInChildren<Il2CppActor.Targetable>(true); } catch { }
+                        try { turret.m_target = playerTargetable2; } catch { }
+                        try { turret.m_alertness = 1f; } catch { }
+                        try { if (turret.m_targetReadinessRoutine == null) turret.StartCoroutine(turret.TargetReadinessRoutine(true)); } catch { }
+                        try { turret.StartCoroutine(turret.LineOfSightCheckRoutine()); } catch { }
+                        try { turret.StartCoroutine(turret.DrawAttentionRoutine((Il2CppTurret.SimpleTurret.Attention)4, 0f)); } catch { }
+                        LoggerInstance.Msg($"[COMBAT]     Turret[{t}]: target set, alertness=1, routines started");
+                    }
+                }
+                catch (Exception ex) { LoggerInstance.Msg($"[COMBAT]   Turret setup: {ex.Message}"); }
+
+                // Enable AiAircraftWeapon if any (turrets on naval ships use these)
+                try
+                {
+                    var aiWeapons = clone.GetComponentsInChildren<Il2CppAi.AiAircraftWeapon>(true);
+                    for (int w = 0; w < (aiWeapons?.Length ?? 0); w++)
+                    {
+                        aiWeapons[w].IsActive = true;
+                        aiWeapons[w].gameObject.SetActive(true);
+                        if (playerITargetable != null)
+                        {
+                            try { aiWeapons[w].CurrentTarget = playerITargetable; } catch { }
+                        }
+                        LoggerInstance.Msg($"[COMBAT]     AiWeapon[{w}]: '{aiWeapons[w].gameObject.name}' IsActive={aiWeapons[w].IsActive}");
+                    }
+                }
+                catch { }
+
+                // Enable all FiringMechanisms with infinite ammo
+                try
+                {
+                    var fms = clone.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(true);
+                    for (int f = 0; f < (fms?.Length ?? 0); f++)
+                    {
+                        fms[f].gameObject.SetActive(true);
+                        fms[f].m_isEnabled = true;
+                        var fm = fms[f].TryCast<Il2CppWeapon.FiringMechanism>();
+                        if (fm != null) fm.m_isInfiniteAmmo = true;
+                    }
+                    LoggerInstance.Msg($"[COMBAT]   FiringMechanisms: {fms?.Length ?? 0}");
+                }
+                catch { }
+
+                spawnedCombatants.Add(clone);
+                combatActiveFighters = spawnedCombatants.Count;
+                LoggerInstance.Msg($"[COMBAT] === Turret '{clone.name}' spawned at ({spawnPos.x:F0},{spawnPos.y:F0},{spawnPos.z:F0}) ===");
+                SetStatus($"Turret spawned! ({combatActiveFighters} active)");
+            }
+            catch (Exception ex)
+            {
+                LoggerInstance.Error($"[COMBAT] SpawnGroundTurret: {ex}");
+                SetStatus($"Turret spawn failed: {ex.Message}");
+            }
+        }
+
+        private void SpawnNavalShip(Vector3 spawnPos)
+        {
+            if (cachedShipPrefabs.Count == 0) { SetStatus("No ship prefabs — play a naval combat mission first"); return; }
+
+            try
+            {
+                var ac = GameManager.ControllerAircraft;
+                if (ac == null) { SetStatus("Not in aircraft"); return; }
+
+                var prefab = cachedShipPrefabs[UnityEngine.Random.Range(0, cachedShipPrefabs.Count)];
+                LoggerInstance.Msg($"[COMBAT] SpawnNavalShip using '{prefab.name}'");
+
+                var clone = UnityEngine.Object.Instantiate(prefab);
+                clone.name = "HS_Ship_" + UnityEngine.Random.Range(1000, 9999);
+                clone.transform.position = spawnPos;
+                // Face toward player
+                Vector3 lookDir = ac.transform.position - spawnPos;
+                lookDir.y = 0;
+                if (lookDir.sqrMagnitude > 0.01f)
+                    clone.transform.rotation = Quaternion.LookRotation(lookDir);
+                clone.SetActive(true);
+
+                // Ships should float — set appropriate rigidbody
+                var rb = clone.GetComponent<Rigidbody>();
+                if (rb != null)
+                {
+                    rb.isKinematic = true; // ships don't drift
+                    LoggerInstance.Msg($"[COMBAT]   Ship Rigidbody set kinematic");
+                }
+
+                // Get player target
+                Il2CppActor.ITargetable playerITargetable = null;
+                try { playerITargetable = ac.TryCast<Il2CppActor.ITargetable>(); } catch { }
+
+                // Activate turrets on the ship
+                try
+                {
+                    var turrets = clone.GetComponentsInChildren<Il2CppTurret.SimpleTurret>(true);
+                    LoggerInstance.Msg($"[COMBAT]   Ship turrets: {turrets?.Length ?? 0}");
+                    for (int t = 0; t < (turrets?.Length ?? 0); t++)
+                        turrets[t].gameObject.SetActive(true);
+                }
+                catch { }
+
+                // Activate AI weapons and point at player
+                try
+                {
+                    var aiWeapons = clone.GetComponentsInChildren<Il2CppAi.AiAircraftWeapon>(true);
+                    for (int w = 0; w < (aiWeapons?.Length ?? 0); w++)
+                    {
+                        aiWeapons[w].IsActive = true;
+                        aiWeapons[w].gameObject.SetActive(true);
+                        if (playerITargetable != null)
+                        {
+                            try { aiWeapons[w].CurrentTarget = playerITargetable; } catch { }
+                        }
+                    }
+                    LoggerInstance.Msg($"[COMBAT]   Ship AiWeapons: {aiWeapons?.Length ?? 0}");
+                }
+                catch { }
+
+                // Enable all FiringMechanisms
+                try
+                {
+                    var fms = clone.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(true);
+                    for (int f = 0; f < (fms?.Length ?? 0); f++)
+                    {
+                        fms[f].gameObject.SetActive(true);
+                        fms[f].m_isEnabled = true;
+                        var fm = fms[f].TryCast<Il2CppWeapon.FiringMechanism>();
+                        if (fm != null) fm.m_isInfiniteAmmo = true;
+                    }
+                    LoggerInstance.Msg($"[COMBAT]   Ship FiringMechanisms: {fms?.Length ?? 0}");
+                }
+                catch { }
+
+                spawnedCombatants.Add(clone);
+                combatActiveFighters = spawnedCombatants.Count;
+                LoggerInstance.Msg($"[COMBAT] === Ship '{clone.name}' spawned at ({spawnPos.x:F0},{spawnPos.y:F0},{spawnPos.z:F0}) ===");
+                SetStatus($"Ship spawned! ({combatActiveFighters} active)");
+            }
+            catch (Exception ex)
+            {
+                LoggerInstance.Error($"[COMBAT] SpawnNavalShip: {ex}");
+                SetStatus($"Ship spawn failed: {ex.Message}");
             }
         }
 
@@ -4245,11 +5161,12 @@ namespace UW2Mod
 
         private void UpdateDrones()
         {
+            if (activeDrones.Count == 0) return;
             var ac = GameManager.ControllerAircraft;
             if (ac == null) return;
             Vector3 playerPos = ac.transform.position;
             Vector3 playerVel = Vector3.zero;
-            try { var prb = ac.GetComponent<Rigidbody>(); if (prb != null) playerVel = prb.velocity; } catch { }
+            try { var prb = ac.gameObject.GetComponent<Rigidbody>(); if (prb != null) playerVel = prb.velocity; } catch { }
 
             for (int i = activeDrones.Count - 1; i >= 0; i--)
             {
@@ -4355,37 +5272,34 @@ namespace UW2Mod
                 float angle = Vector3.Angle(drone.go.transform.forward, toPlayer);
                 drone.fireTimer -= dt;
 
+                // Cache weapons on first access
+                if (drone.cachedWeapons == null)
+                {
+                    try { drone.cachedWeapons = drone.go.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(); }
+                    catch { drone.cachedWeapons = new Il2CppWeapon.FiringMechanismBase[0]; }
+                }
+
                 if (dist < drone.fireRange && angle < drone.fireAngle && drone.fireTimer <= 0f && drone.attackPhase != 2f)
                 {
                     drone.fireTimer = drone.fireInterval;
-                    try
+                    for (int w = 0; w < drone.cachedWeapons.Length; w++)
                     {
-                        var fms = drone.go.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>();
-                        for (int w = 0; w < fms.Length; w++)
+                        try
                         {
-                            try
-                            {
-                                fms[w].m_isEnabled = true;
-                                fms[w].m_readyToFire = true;
-                                fms[w].m_triggerWasPulled = true;
-                            }
-                            catch { }
+                            drone.cachedWeapons[w].m_isEnabled = true;
+                            drone.cachedWeapons[w].m_readyToFire = true;
+                            drone.cachedWeapons[w].m_triggerWasPulled = true;
                         }
+                        catch { }
                     }
-                    catch { }
                 }
                 else
                 {
-                    try
+                    for (int w = 0; w < drone.cachedWeapons.Length; w++)
                     {
-                        var fms = drone.go.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>();
-                        for (int w = 0; w < fms.Length; w++)
-                        {
-                            try { fms[w].m_triggerWasPulled = false; }
-                            catch { }
-                        }
+                        try { drone.cachedWeapons[w].m_triggerWasPulled = false; }
+                        catch { }
                     }
-                    catch { }
                 }
             }
         }
@@ -4414,16 +5328,27 @@ namespace UW2Mod
 
             for (int i = 0; i < fighterCount; i++)
             {
-                // Spawn in a spread pattern around the player
                 float angle = (360f / fighterCount) * i + UnityEngine.Random.Range(-20f, 20f);
                 float dist = UnityEngine.Random.Range(300f, 600f);
                 float alt = UnityEngine.Random.Range(-30f, 80f);
                 Vector3 offset = Quaternion.Euler(0, angle, 0) * Vector3.forward * dist;
                 Vector3 spawnPos = ac.transform.position + offset + Vector3.up * alt;
 
-                // Face toward player
-                Quaternion rot = Quaternion.LookRotation(ac.transform.position - spawnPos);
-                SpawnFighter(spawnPos, rot);
+                // Use scene-hook prefabs (SpawnEnemyFighter) if available, fall back to scan prefabs
+                if (enemyPrefabsReady && (IsValidCachedPrefab(cachedEnemyMesser) || IsValidCachedPrefab(cachedEnemyWolf)))
+                {
+                    SpawnEnemyFighter(spawnPos);
+                }
+                else if (cachedFighterPrefabs.Count > 0)
+                {
+                    Quaternion rot = Quaternion.LookRotation(ac.transform.position - spawnPos);
+                    SpawnFighter(spawnPos, rot);
+                }
+                else
+                {
+                    SetStatus("No enemy prefabs — play a combat mission first");
+                    return;
+                }
             }
         }
 
@@ -4849,6 +5774,148 @@ namespace UW2Mod
                         LoggerInstance.Msg("[CARRIER] Signal is null — not initialized");
                         SetStatus("Signal is null");
                     }
+                }
+                catch (Exception ex) { SetStatus($"Failed: {ex.Message}"); LoggerInstance.Error($"[CARRIER] {ex}"); }
+            });
+
+            B("Dump Dev Config (check log)", () => {
+                try
+                {
+                    LoggerInstance.Msg("[CARRIER] === DEV CONFIG DUMP ===");
+                    var mediators = Resources.FindObjectsOfTypeAll<Il2Cpp.ScreenProjectorMediator>();
+                    LoggerInstance.Msg($"[CARRIER] Mediator count: {mediators?.Length ?? 0}");
+                    for (int i = 0; i < (mediators?.Length ?? 0); i++)
+                    {
+                        var m = mediators[i];
+                        // Dump ALL mediator properties
+                        var mType = m.GetType();
+                        LoggerInstance.Msg($"[CARRIER] --- Mediator[{i}] type={mType.FullName} ---");
+                        var props = mType.GetProperties();
+                        foreach (var p in props)
+                        {
+                            if (p.Name.StartsWith("NativeMethodInfoPtr") || p.Name == "Pointer" || p.Name == "ObjectClass") continue;
+                            try
+                            {
+                                var val = p.GetValue(m);
+                                LoggerInstance.Msg($"[CARRIER]   M.{p.Name} = {val}");
+                            }
+                            catch (Exception ex) { LoggerInstance.Msg($"[CARRIER]   M.{p.Name} = ERROR: {ex.Message}"); }
+                        }
+                        // Dump interesting fields
+                        var fields = mType.GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                        foreach (var f in fields)
+                        {
+                            if (f.Name.StartsWith("NativeFieldInfoPtr") || f.Name == "isWrapped" || f.Name == "pooledPtr") continue;
+                            try
+                            {
+                                var val = f.GetValue(m);
+                                LoggerInstance.Msg($"[CARRIER]   M field {f.Name} = {val}");
+                            }
+                            catch (Exception ex) { LoggerInstance.Msg($"[CARRIER]   M field {f.Name} = ERROR: {ex.Message}"); }
+                        }
+                    }
+                    // Dump FastTravelController
+                    if (mediators.Length > 0)
+                    {
+                        var ftc = mediators[0].m_fastTravelController;
+                        if (ftc != null)
+                        {
+                            var ftcType = ftc.GetType();
+                            LoggerInstance.Msg($"[CARRIER] --- FastTravelController type={ftcType.FullName} ---");
+                            foreach (var p in ftcType.GetProperties())
+                            {
+                                if (p.Name.StartsWith("NativeMethodInfoPtr") || p.Name == "Pointer" || p.Name == "ObjectClass") continue;
+                                try { LoggerInstance.Msg($"[CARRIER]   FTC.{p.Name} = {p.GetValue(ftc)}"); }
+                                catch (Exception ex) { LoggerInstance.Msg($"[CARRIER]   FTC.{p.Name} = ERROR: {ex.Message}"); }
+                            }
+                            foreach (var f in ftcType.GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance))
+                            {
+                                if (f.Name.StartsWith("NativeFieldInfoPtr") || f.Name == "isWrapped" || f.Name == "pooledPtr") continue;
+                                try { LoggerInstance.Msg($"[CARRIER]   FTC field {f.Name} = {f.GetValue(ftc)}"); }
+                                catch (Exception ex) { LoggerInstance.Msg($"[CARRIER]   FTC field {f.Name} = ERROR: {ex.Message}"); }
+                            }
+                        }
+                        else { LoggerInstance.Msg("[CARRIER] FastTravelController is null"); }
+
+                        // Dump WorldMapMediatorHandler
+                        var wmh = mediators[0].m_worldMapMediatorHandler;
+                        if (wmh != null)
+                        {
+                            var wmhType = wmh.GetType();
+                            LoggerInstance.Msg($"[CARRIER] --- WorldMapMediatorHandler type={wmhType.FullName} ---");
+                            foreach (var p in wmhType.GetProperties())
+                            {
+                                if (p.Name.StartsWith("NativeMethodInfoPtr") || p.Name == "Pointer" || p.Name == "ObjectClass") continue;
+                                try { LoggerInstance.Msg($"[CARRIER]   WMH.{p.Name} = {p.GetValue(wmh)}"); }
+                                catch (Exception ex) { LoggerInstance.Msg($"[CARRIER]   WMH.{p.Name} = ERROR: {ex.Message}"); }
+                            }
+                            foreach (var f in wmhType.GetFields(System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance))
+                            {
+                                if (f.Name.StartsWith("NativeFieldInfoPtr") || f.Name == "isWrapped" || f.Name == "pooledPtr") continue;
+                                try { LoggerInstance.Msg($"[CARRIER]   WMH field {f.Name} = {f.GetValue(wmh)}"); }
+                                catch (Exception ex) { LoggerInstance.Msg($"[CARRIER]   WMH field {f.Name} = ERROR: {ex.Message}"); }
+                            }
+                        }
+                        else { LoggerInstance.Msg("[CARRIER] WorldMapMediatorHandler is null"); }
+                    }
+
+                    int sceneCount = UnityEngine.SceneManagement.SceneManager.sceneCount;
+                    LoggerInstance.Msg($"[CARRIER] Loaded scenes: {sceneCount}");
+                    for (int i = 0; i < sceneCount; i++)
+                    {
+                        var scene = UnityEngine.SceneManagement.SceneManager.GetSceneAt(i);
+                        LoggerInstance.Msg($"[CARRIER]   Scene[{i}]: name='{scene.name}' buildIndex={scene.buildIndex} isLoaded={scene.isLoaded}");
+                    }
+                    SetStatus($"Dev config dumped — check log");
+                }
+                catch (Exception ex) { SetStatus($"Failed: {ex.Message}"); LoggerInstance.Error($"[CARRIER] {ex}"); }
+            });
+
+            B("Set Carrier + Signal", () => {
+                try
+                {
+                    var mediators = Resources.FindObjectsOfTypeAll<Il2Cpp.ScreenProjectorMediator>();
+                    if (mediators == null || mediators.Length == 0) { SetStatus("No mediators"); return; }
+                    var m = mediators[0];
+                    m.m_isOnAircraftCarrier = true;
+                    // Try setting TestLevel and SkipLoadingRoom via reflection on the DO
+                    var doObj = m.m_screenProjectorDO;
+                    if (doObj != null)
+                    {
+                        var doType = doObj.GetType();
+                        string[] boolProps = { "TestLevel", "SkipLoadingRoom" };
+                        foreach (var propName in boolProps)
+                        {
+                            try
+                            {
+                                var prop = doType.GetProperty(propName);
+                                if (prop != null && prop.CanWrite)
+                                {
+                                    prop.SetValue(doObj, true);
+                                    LoggerInstance.Msg($"[CARRIER] Set {propName}=true via property");
+                                }
+                                else
+                                {
+                                    var field = doType.GetField(propName, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+                                    if (field != null)
+                                    {
+                                        field.SetValue(doObj, true);
+                                        LoggerInstance.Msg($"[CARRIER] Set {propName}=true via field");
+                                    }
+                                    else { LoggerInstance.Msg($"[CARRIER] {propName}: no property or field found"); }
+                                }
+                            }
+                            catch (Exception ex) { LoggerInstance.Msg($"[CARRIER] {propName} set error: {ex.Message}"); }
+                        }
+                    }
+                    var signal = ScreenProjectorSignals.GotoAircraftCarrierClicked;
+                    if (signal != null)
+                    {
+                        signal.Dispatch();
+                        LoggerInstance.Msg("[CARRIER] Signal dispatched with flags set");
+                        SetStatus("Carrier flags + signal sent!");
+                    }
+                    else { SetStatus("Flags set but signal null"); }
                 }
                 catch (Exception ex) { SetStatus($"Failed: {ex.Message}"); LoggerInstance.Error($"[CARRIER] {ex}"); }
             });
@@ -5547,8 +6614,24 @@ namespace UW2Mod
                     lines.Add($"combatSceneName={savedCombatSceneName}");
                     lines.Add($"combatSceneIndex={savedCombatSceneIndex}");
                 }
+                // Hostile Skies progression
+                lines.Add($"scrap={scrap}");
+                lines.Add($"totalScrapEarned={totalScrapEarned}");
+                lines.Add($"upgradeArmor={upgradeArmor}");
+                lines.Add($"upgradeFireRate={upgradeFireRate}");
+                lines.Add($"upgradeAmmoCapacity={upgradeAmmoCapacity}");
+                lines.Add($"upgradeSpeed={upgradeSpeed}");
+                lines.Add($"upgradeHandling={upgradeHandling}");
+                lines.Add($"explosiveAmmoUnlocked={explosiveAmmoUnlocked}");
+                lines.Add($"activeSpeedPreset={activeSpeedPreset}");
+                lines.Add($"secondaryWeaponType={secondaryWeaponType}");
+                lines.Add($"hsHasFighters={hsHasFighters}");
+                lines.Add($"hsHasTurrets={hsHasTurrets}");
+                lines.Add($"hsHasShips={hsHasShips}");
+                lines.Add($"hsHasGroundVehicles={hsHasGroundVehicles}");
+                lines.Add($"hsFullyUnlocked={hsFullyUnlocked}");
                 File.WriteAllLines(combatSavePath, lines);
-                LoggerInstance.Msg($"[HOSTILE] Saved: kills={totalKills} streak={bestStreak} threat={threatLevelUnlocked}");
+                LoggerInstance.Msg($"[HOSTILE] Saved: kills={totalKills} streak={bestStreak} scrap={scrap} upgrades=A{upgradeArmor}/F{upgradeFireRate}/C{upgradeAmmoCapacity}/S{upgradeSpeed}/H{upgradeHandling}");
             }
             catch (Exception ex) { LoggerInstance.Msg($"[HOSTILE] Save failed: {ex.Message}"); }
         }
@@ -5581,8 +6664,34 @@ namespace UW2Mod
                         islandsDiscovered = 0;
                         for (int i = 0; i < islandDiscoveryMap.Length; i++) if (islandDiscoveryMap[i]) islandsDiscovered++;
                     }
+                    // Hostile Skies progression
+                    if (line.StartsWith("scrap=")) int.TryParse(line.Substring(6), out scrap);
+                    if (line.StartsWith("totalScrapEarned=")) int.TryParse(line.Substring(17), out totalScrapEarned);
+                    if (line.StartsWith("upgradeArmor=")) int.TryParse(line.Substring(13), out upgradeArmor);
+                    if (line.StartsWith("upgradeFireRate=")) int.TryParse(line.Substring(16), out upgradeFireRate);
+                    if (line.StartsWith("upgradeAmmoCapacity=")) int.TryParse(line.Substring(20), out upgradeAmmoCapacity);
+                    if (line.StartsWith("upgradeSpeed=")) int.TryParse(line.Substring(13), out upgradeSpeed);
+                    if (line.StartsWith("upgradeHandling=")) int.TryParse(line.Substring(16), out upgradeHandling);
+                    if (line.StartsWith("explosiveAmmoUnlocked=")) explosiveAmmoUnlocked = line.Contains("True");
+                    if (line.StartsWith("activeSpeedPreset=")) int.TryParse(line.Substring(18), out activeSpeedPreset);
+                    if (line.StartsWith("secondaryWeaponType=")) int.TryParse(line.Substring(20), out secondaryWeaponType);
+                    if (line.StartsWith("hsHasFighters=")) hsHasFighters = line.Contains("True");
+                    if (line.StartsWith("hsHasTurrets=")) hsHasTurrets = line.Contains("True");
+                    if (line.StartsWith("hsHasShips=")) hsHasShips = line.Contains("True");
+                    if (line.StartsWith("hsHasGroundVehicles=")) hsHasGroundVehicles = line.Contains("True");
+                    if (line.StartsWith("hsFullyUnlocked=")) hsFullyUnlocked = line.Contains("True");
                 }
-                LoggerInstance.Msg($"[HOSTILE] Loaded: kills={totalKills} streak={bestStreak} threat={threatLevelUnlocked} islands={islandsDiscovered}");
+                // Clamp all loaded values to valid ranges (protect against corrupted saves)
+                upgradeArmor = Math.Max(0, Math.Min(upgradeArmor, 4));
+                upgradeFireRate = Math.Max(0, Math.Min(upgradeFireRate, 4));
+                upgradeAmmoCapacity = Math.Max(0, Math.Min(upgradeAmmoCapacity, 4));
+                upgradeSpeed = Math.Max(0, Math.Min(upgradeSpeed, 4));
+                upgradeHandling = Math.Max(0, Math.Min(upgradeHandling, 4));
+                activeSpeedPreset = Math.Max(0, Math.Min(activeSpeedPreset, speedPresetNames.Length - 1));
+                threatLevelUnlocked = Math.Max(1, Math.Min(threatLevelUnlocked, 5));
+                if (scrap < 0) scrap = 0;
+
+                LoggerInstance.Msg($"[HOSTILE] Loaded: kills={totalKills} streak={bestStreak} scrap={scrap} upgrades=A{upgradeArmor}/F{upgradeFireRate}/C{upgradeAmmoCapacity}/S{upgradeSpeed}/H{upgradeHandling}");
             }
             catch { }
         }
@@ -5668,7 +6777,7 @@ namespace UW2Mod
             }
             catch (Exception ex) { LoggerInstance.Msg($"[HOSTILE] Island scan: {ex.Message}"); }
 
-            zonesInitialized = combatZones.Count > 0;
+            zonesInitialized = true; // always mark done, even if 0 found — prevents per-frame rescan
             LoggerInstance.Msg($"[HOSTILE] Zones initialized: {combatZones.Count} total");
 
             // Dump zones to file for reference
@@ -5702,6 +6811,9 @@ namespace UW2Mod
             if (changed) SaveCombatState();
         }
 
+        // ================================================================
+        // HOSTILE SKIES — STATE MACHINE
+        // ================================================================
         private void UpdateHostileSkies()
         {
             if (!hostileSkiesActive || !initialized) return;
@@ -5714,12 +6826,13 @@ namespace UW2Mod
             if (!zonesInitialized) InitializeZones();
             if (!combatPrefabsScanned) ScanCombatPrefabs();
 
-            // --- Kill Detection (every 1 second) ---
+            hsStateTimer += Time.deltaTime;
+
+            // --- Kill Detection (runs in all active states, every 0.5s) ---
             killCheckTimer += Time.deltaTime;
-            if (killCheckTimer >= 1f)
+            if (killCheckTimer >= 0.5f)
             {
                 killCheckTimer = 0f;
-                // Clean destroyed combatants
                 int before = spawnedCombatants.Count;
                 for (int i = spawnedCombatants.Count - 1; i >= 0; i--)
                 {
@@ -5727,117 +6840,39 @@ namespace UW2Mod
                     catch { spawnedCombatants.RemoveAt(i); }
                 }
                 int killed = before - spawnedCombatants.Count;
-                if (killed > 0 && before > previousCombatantCount - killed) // only count actual kills, not cleanup
+                if (killed > 0 && before > previousCombatantCount - killed)
                 {
                     totalKills += killed;
                     sessionKills += killed;
                     killStreak += killed;
+                    waveKills += killed;
+                    engagementKills += killed;
                     if (killStreak > bestStreak) bestStreak = killStreak;
-                    LoggerInstance.Msg($"[HOSTILE] +{killed} kills! Total={totalKills} Streak={killStreak} Best={bestStreak}");
+
+                    // Award scrap per kill with streak multiplier
+                    int killScrap = SCRAP_PER_FIGHTER * killed;
+                    scrap += killScrap;
+                    totalScrapEarned += killScrap;
+
+                    LoggerInstance.Msg($"[HS] +{killed} kills! +{killScrap} scrap Total={totalKills} Streak={killStreak} Scrap={scrap}");
                     CheckUnlocks();
+                }
+
+                // Always clean wave enemy list (even if no kills — handles despawned enemies)
+                for (int i = currentWaveEnemies.Count - 1; i >= 0; i--)
+                {
+                    try { if (currentWaveEnemies[i] == null || !currentWaveEnemies[i].activeSelf) currentWaveEnemies.RemoveAt(i); }
+                    catch { currentWaveEnemies.RemoveAt(i); }
                 }
                 combatActiveFighters = spawnedCombatants.Count;
                 previousCombatantCount = combatActiveFighters;
             }
 
-            // --- Zone Proximity Check (every 1 second) ---
+            // --- Despawn far-away combatants (>2km, runs every state) ---
             zoneCheckTimer += Time.deltaTime;
             if (zoneCheckTimer >= 1f)
             {
                 zoneCheckTimer = 0f;
-                for (int i = 0; i < combatZones.Count; i++)
-                {
-                    var zone = combatZones[i];
-
-                    // Tick cooldown
-                    if (zone.CooldownRemaining > 0f)
-                    {
-                        zone.CooldownRemaining -= 1f;
-                        combatZones[i] = zone;
-                        continue;
-                    }
-
-                    float dist = Vector3.Distance(playerPos, zone.Position);
-
-                    // Zone type filtering by threat level
-                    bool zoneActive = false;
-                    if (zone.ZoneType == 0) zoneActive = true; // Airfields always active
-                    if (zone.ZoneType == 1 && threatLevel >= 2) zoneActive = true; // Flyover at threat 2+
-                    if (zone.ZoneType == 2 && threatLevel >= 3) zoneActive = true; // Naval at threat 3+
-                    if (zone.ZoneType == 3 && threatLevel >= 3) zoneActive = true; // Mountain at threat 3+
-
-                    if (!zoneActive) continue;
-
-                    if (dist < zone.Radius)
-                    {
-                        // Island discovery
-                        if (!zone.Discovered)
-                        {
-                            zone.Discovered = true;
-                            combatZones[i] = zone;
-                            // Try to map to island index
-                            for (int isl = 0; isl < 9; isl++)
-                            {
-                                if (zone.Name.Contains(isl.ToString()) && !islandDiscoveryMap[isl])
-                                {
-                                    islandDiscoveryMap[isl] = true;
-                                    islandsDiscovered++;
-                                    SetStatus($"Discovered: {zone.Name}!");
-                                    LoggerInstance.Msg($"[HOSTILE] Island discovered: {zone.Name} (total: {islandsDiscovered})");
-                                    CheckUnlocks();
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Spawn encounter based on threat level
-                        int spawnCount = 0;
-                        switch (threatLevel)
-                        {
-                            case 1: spawnCount = 1; break;
-                            case 2: spawnCount = 2; break;
-                            case 3: spawnCount = UnityEngine.Random.Range(3, 5); break;
-                            case 4: spawnCount = UnityEngine.Random.Range(4, 7); break;
-                            case 5: spawnCount = UnityEngine.Random.Range(6, 10); break;
-                        }
-
-                        // Don't exceed max active
-                        int maxActive = threatLevel * 4;
-                        spawnCount = Math.Min(spawnCount, maxActive - combatActiveFighters);
-
-                        if (spawnCount > 0 && cachedFighterPrefabs.Count > 0)
-                        {
-                            SpawnWave(spawnCount);
-                            killStreak = 0; // reset streak on new encounter (keeps tension)
-                            LoggerInstance.Msg($"[HOSTILE] Zone '{zone.Name}' triggered! Spawned {spawnCount} at threat {threatLevel}");
-                        }
-
-                        // Set cooldown based on threat level
-                        float[] cooldowns = { 60f, 40f, 25f, 15f, 8f };
-                        zone.CooldownRemaining = cooldowns[Math.Min(threatLevel - 1, 4)];
-                        combatZones[i] = zone;
-                    }
-                }
-
-                // --- Ambient Spawns at threat 4+ ---
-                if (threatLevel >= 4)
-                {
-                    ambientSpawnTimer += 1f;
-                    float ambientInterval = threatLevel >= 5 ? 60f : 120f;
-                    if (ambientSpawnTimer >= ambientInterval)
-                    {
-                        ambientSpawnTimer = 0f;
-                        int maxActive = threatLevel * 4;
-                        if (combatActiveFighters < maxActive && cachedFighterPrefabs.Count > 0)
-                        {
-                            int ambientCount = UnityEngine.Random.Range(1, 3);
-                            SpawnWave(ambientCount);
-                            LoggerInstance.Msg($"[HOSTILE] Ambient spawn: {ambientCount} fighters");
-                        }
-                    }
-                }
-
-                // --- Despawn far-away combatants (>2km) ---
                 for (int i = spawnedCombatants.Count - 1; i >= 0; i--)
                 {
                     try
@@ -5846,12 +6881,590 @@ namespace UW2Mod
                         {
                             UnityEngine.Object.Destroy(spawnedCombatants[i]);
                             spawnedCombatants.RemoveAt(i);
-                            LoggerInstance.Msg("[HOSTILE] Despawned distant combatant");
                         }
                     }
                     catch { spawnedCombatants.RemoveAt(i); }
                 }
             }
+
+            // --- State Machine ---
+            switch (hsState)
+            {
+                case HS_INACTIVE:
+                    // Transition: player toggled HS on → go to ROAMING
+                    hsState = HS_ROAMING;
+                    hsStateTimer = 0f;
+                    killStreak = 0;
+                    streakMultiplier = 1.0f;
+                    LoggerInstance.Msg("[HS] State → ROAMING");
+                    SetStatus("ROAMING — Fly to a zone or use 'Start Engagement' on the panel");
+                    if (!hsMusicPlaying) PlayHSMusic();
+                    break;
+
+                case HS_ROAMING:
+                    HSUpdateRoaming(ac, playerPos);
+                    break;
+
+                case HS_ENGAGEMENT:
+                    HSUpdateEngagement(ac, playerPos);
+                    break;
+
+                case HS_WAVE_COMPLETE:
+                    HSUpdateWaveComplete(ac, playerPos);
+                    break;
+
+                case HS_DEFEATED:
+                    HSUpdateDefeated(ac);
+                    break;
+
+                // HS_SHOP: no per-frame update, shop is menu-driven
+            }
+        }
+
+        private void HSUpdateRoaming(Il2Cpp.ControllerAircraft ac, Vector3 playerPos)
+        {
+            // Check zone proximity — entering a zone triggers an engagement
+            for (int i = 0; i < combatZones.Count; i++)
+            {
+                var zone = combatZones[i];
+
+                // Tick cooldown
+                if (zone.CooldownRemaining > 0f)
+                {
+                    zone.CooldownRemaining -= Time.deltaTime;
+                    combatZones[i] = zone;
+                    continue;
+                }
+
+                float dist = Vector3.Distance(playerPos, zone.Position);
+
+                // Zone type filtering by threat level
+                bool zoneActive = false;
+                if (zone.ZoneType == 0) zoneActive = true;
+                if (zone.ZoneType == 1 && threatLevel >= 2) zoneActive = true;
+                if (zone.ZoneType == 2 && threatLevel >= 3) zoneActive = true;
+                if (zone.ZoneType == 3 && threatLevel >= 3) zoneActive = true;
+                if (!zoneActive) continue;
+
+                if (dist < zone.Radius)
+                {
+                    // Island discovery (keep existing logic)
+                    if (!zone.Discovered)
+                    {
+                        zone.Discovered = true;
+                        combatZones[i] = zone;
+                        for (int isl = 0; isl < 9; isl++)
+                        {
+                            if (zone.Name.Contains(isl.ToString()) && !islandDiscoveryMap[isl])
+                            {
+                                islandDiscoveryMap[isl] = true;
+                                islandsDiscovered++;
+                                SetStatus($"Discovered: {zone.Name}!");
+                                LoggerInstance.Msg($"[HS] Island discovered: {zone.Name} (total: {islandsDiscovered})");
+                                CheckUnlocks();
+                                break;
+                            }
+                        }
+                    }
+
+                    // Start engagement!
+                    HSStartEngagement(i, zone);
+
+                    // Set zone cooldown
+                    float[] cooldowns = { 60f, 40f, 25f, 15f, 8f };
+                    zone.CooldownRemaining = cooldowns[Math.Min(threatLevel - 1, 4)];
+                    combatZones[i] = zone;
+                    break; // only one engagement at a time
+                }
+            }
+
+            // Ambient spawns at threat 4+ (random encounters while roaming)
+            if (threatLevel >= 4)
+            {
+                ambientSpawnTimer += Time.deltaTime;
+                float ambientInterval = threatLevel >= 5 ? 60f : 120f;
+                if (ambientSpawnTimer >= ambientInterval)
+                {
+                    ambientSpawnTimer = 0f;
+                    int maxActive = threatLevel * 4;
+                    if (combatActiveFighters < maxActive)
+                    {
+                        // Small ambient skirmish — just spawn fighters, don't start full engagement
+                        int ambientCount = Math.Min(UnityEngine.Random.Range(1, 3), maxActive - combatActiveFighters);
+                        if (ambientCount > 0)
+                        {
+                            SpawnWave(ambientCount);
+                            LoggerInstance.Msg($"[HS] Ambient spawn: {ambientCount} fighters");
+                            SetStatus($"Bogeys inbound! {ambientCount} hostiles!");
+                        }
+                    }
+                }
+            }
+        }
+
+        private void HSStartEngagement(int zoneIndex, CombatZone zone)
+        {
+            // Determine wave count based on threat level
+            switch (threatLevel)
+            {
+                case 1: totalWaves = 1; break;
+                case 2: totalWaves = UnityEngine.Random.Range(1, 3); break;
+                case 3: totalWaves = UnityEngine.Random.Range(2, 4); break;
+                case 4: totalWaves = UnityEngine.Random.Range(3, 5); break;
+                case 5: totalWaves = UnityEngine.Random.Range(4, 6); break;
+                default: totalWaves = 1; break;
+            }
+
+            currentWave = 0;
+            engagementKills = 0;
+            currentEngagementZoneIndex = zoneIndex;
+            hsState = HS_ENGAGEMENT;
+            hsStateTimer = 0f;
+
+            string zoneName = zoneIndex >= 0 ? zone.Name : "Open Sky";
+            LoggerInstance.Msg($"[HS] State → ENGAGEMENT at '{zoneName}' | Threat {threatLevel} | {totalWaves} waves");
+            SetStatus($"ENGAGEMENT! Threat {threatLevel} — {totalWaves} wave{(totalWaves > 1 ? "s" : "")}");
+
+            // Spawn first wave
+            HSSpawnNextWave();
+        }
+
+        private void HSSpawnNextWave()
+        {
+            currentWave++;
+            waveKills = 0;
+            currentWaveEnemies.Clear();
+
+            // Determine fighters per wave based on threat level
+            int fighters = 0;
+            switch (threatLevel)
+            {
+                case 1: fighters = UnityEngine.Random.Range(1, 3); break;
+                case 2: fighters = UnityEngine.Random.Range(2, 4); break;
+                case 3: fighters = UnityEngine.Random.Range(3, 5); break;
+                case 4: fighters = UnityEngine.Random.Range(4, 7); break;
+                case 5: fighters = UnityEngine.Random.Range(6, 9); break;
+            }
+
+            // Cap based on max active
+            int maxActive = threatLevel * 4;
+            fighters = Math.Min(fighters, maxActive - combatActiveFighters);
+            if (fighters <= 0) fighters = 1;
+
+            waveTargetKills = fighters;
+
+            LoggerInstance.Msg($"[HS] Wave {currentWave}/{totalWaves} — spawning {fighters} fighters");
+            SetStatus($"Wave {currentWave}/{totalWaves} — {fighters} hostiles incoming!");
+
+            // Track which enemies belong to this wave (store count before spawn)
+            int beforeCount = spawnedCombatants.Count;
+            SpawnWave(fighters);
+
+            // Capture newly spawned enemies into wave list
+            for (int i = beforeCount; i < spawnedCombatants.Count; i++)
+                currentWaveEnemies.Add(spawnedCombatants[i]);
+
+            // Turrets at threat 3+ for airfield/mountain zones
+            if (threatLevel >= 3 && currentEngagementZoneIndex >= 0 &&
+                currentEngagementZoneIndex < combatZones.Count)
+            {
+                int zoneType = combatZones[currentEngagementZoneIndex].ZoneType;
+                if ((zoneType == 0 || zoneType == 3) && cachedTurretPrefabs.Count > 0)
+                {
+                    int turretCount = threatLevel >= 4 ? 2 : 1;
+                    var zonePos = combatZones[currentEngagementZoneIndex].Position;
+                    for (int t = 0; t < turretCount; t++)
+                    {
+                        Vector3 turretPos = zonePos + Quaternion.Euler(0, UnityEngine.Random.Range(0f, 360f), 0) * Vector3.forward * UnityEngine.Random.Range(50f, 150f);
+                        RaycastHit hit;
+                        if (Physics.Raycast(new Vector3(turretPos.x, 2000f, turretPos.z), Vector3.down, out hit, 3000f))
+                        {
+                            if (hit.point.y > 1f) SpawnGroundTurret(hit.point + Vector3.up * 1f);
+                        }
+                    }
+                }
+            }
+        }
+
+        private void HSUpdateEngagement(Il2Cpp.ControllerAircraft ac, Vector3 playerPos)
+        {
+            // Check if current wave is cleared (all wave enemies dead)
+            bool waveClear = currentWaveEnemies.Count == 0 && hsStateTimer > 3f; // 3s grace period after spawn
+
+            if (waveClear)
+            {
+                // Award wave completion bonus
+                int waveBonus = SCRAP_WAVE_BONUS_BASE * currentWave;
+                scrap += waveBonus;
+                totalScrapEarned += waveBonus;
+                LoggerInstance.Msg($"[HS] Wave {currentWave}/{totalWaves} CLEAR! +{waveBonus} scrap (wave bonus)");
+
+                if (currentWave >= totalWaves)
+                {
+                    // Engagement complete!
+                    int engagementBonus = SCRAP_ENGAGEMENT_BONUS_BASE * threatLevel;
+                    scrap += engagementBonus;
+                    totalScrapEarned += engagementBonus;
+                    LoggerInstance.Msg($"[HS] ENGAGEMENT COMPLETE! +{engagementBonus} scrap (engagement bonus) | Total earned this engagement: {engagementKills} kills");
+
+                    hsState = HS_WAVE_COMPLETE;
+                    hsStateTimer = 0f;
+                    SetStatus($"ENGAGEMENT COMPLETE! +{engagementBonus} scrap!");
+                    SaveCombatState();
+                }
+                else
+                {
+                    // More waves coming — brief pause then next wave
+                    hsState = HS_WAVE_COMPLETE;
+                    hsStateTimer = 0f;
+                    SetStatus($"Wave {currentWave} cleared! +{waveBonus} scrap — next wave incoming...");
+                }
+            }
+
+            // Reinforcement spawns if wave takes too long (>60s) at threat 4+
+            if (threatLevel >= 4 && hsStateTimer > 60f && currentWaveEnemies.Count > 0)
+            {
+                hsStateTimer = 30f; // reset to avoid spam, will trigger again in 30s
+                int reinforcements = UnityEngine.Random.Range(1, 3);
+                int maxActive = threatLevel * 4;
+                reinforcements = Math.Min(reinforcements, maxActive - combatActiveFighters);
+                if (reinforcements > 0)
+                {
+                    int beforeCount = spawnedCombatants.Count;
+                    SpawnWave(reinforcements);
+                    for (int i = beforeCount; i < spawnedCombatants.Count; i++)
+                        currentWaveEnemies.Add(spawnedCombatants[i]);
+                    waveTargetKills += reinforcements;
+                    LoggerInstance.Msg($"[HS] Reinforcements! +{reinforcements} fighters");
+                    SetStatus($"Enemy reinforcements! +{reinforcements}");
+                }
+            }
+        }
+
+        private void HSUpdateWaveComplete(Il2Cpp.ControllerAircraft ac, Vector3 playerPos)
+        {
+            // Pause between waves
+            if (hsStateTimer >= WAVE_COMPLETE_PAUSE)
+            {
+                if (currentWave < totalWaves)
+                {
+                    // Next wave
+                    hsState = HS_ENGAGEMENT;
+                    hsStateTimer = 0f;
+                    HSSpawnNextWave();
+                }
+                else
+                {
+                    // Engagement done — back to roaming
+                    hsState = HS_ROAMING;
+                    hsStateTimer = 0f;
+                    killStreak = 0;
+                    streakMultiplier = 1.0f;
+                    currentEngagementZoneIndex = -1;
+                    LoggerInstance.Msg("[HS] State → ROAMING (engagement complete)");
+                    SetStatus("Engagement complete — roaming...");
+                }
+            }
+            else
+            {
+                // Countdown display
+                int remaining = (int)(WAVE_COMPLETE_PAUSE - hsStateTimer);
+                if (currentWave < totalWaves)
+                    SetStatus($"Wave {currentWave} cleared! Next wave in {remaining}s...");
+            }
+        }
+
+        private void HSUpdateDefeated(Il2Cpp.ControllerAircraft ac)
+        {
+            // Player was defeated — show summary, wait for menu interaction to continue
+            if (hsStateTimer < 0.5f) // show once
+            {
+                SetStatus($"DEFEATED! Session: {sessionKills} kills | {scrap} scrap");
+                LoggerInstance.Msg($"[HS] DEFEATED — session kills={sessionKills} scrap={scrap}");
+                SaveCombatState();
+            }
+            // Player can continue via menu button — transitions back to ROAMING
+            // (handled in BuildHostileSkies menu)
+        }
+
+        // ================================================================
+        // HOSTILE SKIES — IN-GAME TOAST NOTIFICATION
+        // ================================================================
+        private void ShowGameToast(string message, int durationSeconds = 5)
+        {
+            try
+            {
+                var toasts = Resources.FindObjectsOfTypeAll<Il2Cpp.ToastMessageContentView>();
+                if (toasts != null && toasts.Length > 0)
+                {
+                    var toast = toasts[0];
+                    toast.SetMessageText(message);
+                    toast.SetContentActiveState(true);
+                    toast.StartCountdownForHiding(durationSeconds);
+                    LoggerInstance.Msg($"[HS] Toast: {message}");
+                }
+                else
+                {
+                    SetStatus(message);
+                }
+            }
+            catch { SetStatus(message); }
+        }
+
+        // ================================================================
+        // HOSTILE SKIES — SECONDARY WEAPON (Left Trigger = Grenades)
+        // ================================================================
+        private Il2CppWeapon.FiringMechanismBase cachedSecondaryFM = null;
+        private string cachedSecondaryAircraftName = "";
+        private float secondaryFireCooldown = 0f;
+        const float GRENADE_FIRE_INTERVAL = 1.2f; // seconds between grenade shots — slow and deliberate
+
+        private void UpdateSecondaryWeapon()
+        {
+            if (!hostileSkiesActive || !grenadesUnlocked) return;
+            if (showMenu) return; // don't fire while in menu
+
+            // Cooldown tick
+            if (secondaryFireCooldown > 0f)
+            {
+                secondaryFireCooldown -= Time.deltaTime;
+                return; // still on cooldown, skip input check entirely
+            }
+
+            // Check left index trigger (only edge detect, not held)
+            bool leftTrigger = false;
+            try { leftTrigger = OVRInput.Get(OVRInput.RawButton.LIndexTrigger); } catch { }
+            if (!leftTrigger && !Input.GetKey(KeyCode.G)) return; // G key as keyboard fallback
+
+            // Edge detection — fire once per trigger pull, not while held
+            bool wasDown = leftTriggerWasDown;
+            leftTriggerWasDown = leftTrigger;
+            if (leftTrigger && wasDown) return; // held — don't re-fire
+
+            var ac = GameManager.ControllerAircraft;
+            if (ac == null) return;
+
+            // Cache the grenade FiringMechanism — only search on aircraft change
+            string acName = ac.gameObject.name;
+            if (cachedSecondaryFM == null || cachedSecondaryAircraftName != acName)
+            {
+                cachedSecondaryAircraftName = acName;
+                cachedSecondaryFM = null;
+
+                // First ensure weapons are spawned (grenades need m_forceSpawnAll)
+                try
+                {
+                    var wa = ac.gameObject.GetComponentInChildren<Il2CppWeapon.WeaponAttachment>(true);
+                    if (wa != null && !wa.m_forceSpawnAll)
+                    {
+                        wa.m_forceSpawnAll = true;
+                        wa.SpawnWeapons();
+                        var vs = GameManager.VehicleSetup;
+                        if (vs != null) { vs.m_controllerAircraft = ac; vs.m_gunInitComplete = false; vs.InitializeWeaponSystems(); vs.m_gunInitComplete = true; }
+                        LoggerInstance.Msg("[HS] Force-spawned weapons for secondary weapon access");
+                    }
+                }
+                catch { }
+
+                // Find the grenade launcher FiringMechanism
+                try
+                {
+                    var allFMs = ac.gameObject.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(true);
+                    for (int i = 0; i < (allFMs?.Length ?? 0); i++)
+                    {
+                        try
+                        {
+                            string fmName = allFMs[i].gameObject.name.ToLower();
+                            if (fmName.Contains("grenade") || fmName.Contains("launcher"))
+                            {
+                                cachedSecondaryFM = allFMs[i];
+                                LoggerInstance.Msg($"[HS] Secondary weapon cached: '{allFMs[i].gameObject.name}'");
+                                break;
+                            }
+                        }
+                        catch { }
+                    }
+                    // Fallback: if no grenade-named FM found, look for one that's NOT the primary
+                    if (cachedSecondaryFM == null && allFMs != null && allFMs.Length > 1)
+                    {
+                        cachedSecondaryFM = allFMs[allFMs.Length - 1]; // last FM is usually the secondary
+                        LoggerInstance.Msg($"[HS] Secondary weapon (fallback): '{cachedSecondaryFM.gameObject.name}'");
+                    }
+                }
+                catch (Exception ex) { LoggerInstance.Msg($"[HS] Secondary weapon search failed: {ex.Message}"); }
+            }
+
+            if (cachedSecondaryFM == null) return;
+
+            // Fire the grenade!
+            try
+            {
+                cachedSecondaryFM.gameObject.SetActive(true);
+                cachedSecondaryFM.m_isEnabled = true;
+                cachedSecondaryFM.m_readyToFire = true;
+                cachedSecondaryFM.m_triggerWasPulled = true;
+                secondaryFireCooldown = GRENADE_FIRE_INTERVAL;
+                LoggerInstance.Msg("[HS] Secondary weapon FIRED");
+            }
+            catch (Exception ex) { LoggerInstance.Msg($"[HS] Secondary fire failed: {ex.Message}"); }
+        }
+
+        // ================================================================
+        // HOSTILE SKIES — UPGRADE SYSTEM
+        // ================================================================
+        private void ApplyUpgrades()
+        {
+            if (!hostileSkiesActive) return;
+            var ac = GameManager.ControllerAircraft;
+            if (ac == null) return;
+
+            string acName = ac.gameObject.name;
+            LoggerInstance.Msg($"[HS] Applying upgrades to '{acName}': A{upgradeArmor}/F{upgradeFireRate}/C{upgradeAmmoCapacity}/S{upgradeSpeed}/H{upgradeHandling}");
+
+            // --- Armor: modify player HP via Targetable ---
+            try
+            {
+                var targetable = ac.gameObject.GetComponentInChildren<Il2CppActor.Targetable>(true);
+                if (targetable != null)
+                {
+                    if (playerBaseHP < 0) playerBaseHP = targetable.TotalHitPoints; // cache original
+                    int newHP = (int)(playerBaseHP * (1f + upgradeArmor * 0.25f));
+                    targetable.SetTotalHitPoints(newHP, true);
+                    targetable.SetHitPointsToFull();
+                    LoggerInstance.Msg($"[HS]   Armor: {playerBaseHP} → {newHP} HP");
+                }
+            }
+            catch (Exception ex) { LoggerInstance.Msg($"[HS]   Armor upgrade failed: {ex.Message}"); }
+
+            // --- Fire Rate + Ammo Capacity: modify player FiringMechanismConfigDO ---
+            try
+            {
+                var fms = ac.gameObject.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(true);
+                for (int i = 0; i < (fms?.Length ?? 0); i++)
+                {
+                    var fm = fms[i];
+                    string fmKey = acName + "_fm_" + i;
+
+                    // Cache originals on first access
+                    if (!origUpgradeValues.ContainsKey(fmKey))
+                    {
+                        try
+                        {
+                            var config = fm.m_firingMechanismConfig;
+                            if (config != null)
+                            {
+                                origUpgradeValues[fmKey] = new float[] {
+                                    config.m_cooldownTime,
+                                    config.m_maxAmmo,
+                                    config.m_roundsPerMinute
+                                };
+                            }
+                        }
+                        catch { }
+                    }
+
+                    if (origUpgradeValues.ContainsKey(fmKey))
+                    {
+                        var orig = origUpgradeValues[fmKey];
+                        try
+                        {
+                            var config = fm.m_firingMechanismConfig;
+                            if (config != null)
+                            {
+                                // Fire rate: reduce cooldown
+                                float newCooldown = orig[0] * (1f - upgradeFireRate * 0.15f);
+                                config.m_cooldownTime = Math.Max(newCooldown, 0.02f);
+
+                                // Ammo capacity: increase max ammo
+                                int newAmmo = (int)(orig[1] * (1f + upgradeAmmoCapacity * 0.5f));
+                                config.m_maxAmmo = newAmmo;
+
+                                LoggerInstance.Msg($"[HS]   FM[{i}]: cooldown {orig[0]:F3}→{config.m_cooldownTime:F3} ammo {(int)orig[1]}→{config.m_maxAmmo}");
+                            }
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch (Exception ex) { LoggerInstance.Msg($"[HS]   Weapon upgrade failed: {ex.Message}"); }
+
+            // --- Speed: applied via enginePowerMultiplier in the existing per-frame system ---
+            // This is set when speed preset changes, not here
+
+            // --- Handling: modify roll/pitch response ---
+            try
+            {
+                var rta = ac.gameObject.GetComponent<Il2CppTargetableSystem.RigidTargetableAircraft>();
+                if (rta != null)
+                {
+                    var cfg = rta.m_aircraftControllerConfig;
+                    if (cfg != null)
+                    {
+                        string cfgKey = acName + "_handling";
+                        if (!origUpgradeValues.ContainsKey(cfgKey))
+                        {
+                            origUpgradeValues[cfgKey] = new float[] {
+                                cfg.RollEffect, cfg.PitchEffect, cfg.YawEffect
+                            };
+                        }
+                        var origH = origUpgradeValues[cfgKey];
+                        float hMul = 1f + upgradeHandling * 0.15f;
+                        cfg.RollEffect = origH[0] * hMul;
+                        cfg.PitchEffect = origH[1] * hMul;
+                        cfg.YawEffect = origH[2] * hMul;
+                        LoggerInstance.Msg($"[HS]   Handling x{hMul:F2}: roll={cfg.RollEffect:F2} pitch={cfg.PitchEffect:F2} yaw={cfg.YawEffect:F2}");
+                    }
+                }
+            }
+            catch (Exception ex) { LoggerInstance.Msg($"[HS]   Handling upgrade failed: {ex.Message}"); }
+        }
+
+        private bool TryPurchaseUpgrade(ref int upgradeTier, string upgradeName)
+        {
+            if (upgradeTier >= 4) { SetStatus($"{upgradeName} already maxed!"); return false; }
+            int cost = UPGRADE_COSTS[upgradeTier]; // cost for NEXT tier
+            if (scrap < cost) { SetStatus($"Need {cost} scrap for {upgradeName} Tier {upgradeTier + 1} (have {scrap})"); return false; }
+            scrap -= cost;
+            upgradeTier++;
+            LoggerInstance.Msg($"[HS] Purchased {upgradeName} Tier {upgradeTier} for {cost} scrap (remaining: {scrap})");
+            SetStatus($"{upgradeName} Tier {upgradeTier}! (-{cost} scrap)");
+            ApplyUpgrades();
+            SaveCombatState();
+            return true;
+        }
+
+        // Manual engagement trigger (from floating panel or menu)
+        private void HSManualStartEngagement()
+        {
+            if (hsState != HS_ROAMING) { SetStatus("Can only start engagement while roaming"); return; }
+
+            var ac = GameManager.ControllerAircraft;
+            if (ac == null) { SetStatus("Not in aircraft"); return; }
+
+            if (!enemyPrefabsReady && cachedFighterPrefabs.Count == 0)
+            {
+                SetStatus("No enemy prefabs — play a combat mission first");
+                return;
+            }
+
+            // Find nearest zone, or use ambient if none nearby
+            Vector3 playerPos = ac.transform.position;
+            int nearestZone = -1;
+            float nearestDist = float.MaxValue;
+            for (int i = 0; i < combatZones.Count; i++)
+            {
+                float dist = Vector3.Distance(playerPos, combatZones[i].Position);
+                if (dist < combatZones[i].Radius * 2f && dist < nearestDist)
+                {
+                    nearestDist = dist;
+                    nearestZone = i;
+                }
+            }
+
+            if (nearestZone >= 0)
+                HSStartEngagement(nearestZone, combatZones[nearestZone]);
+            else
+                HSStartEngagement(-1, default); // open sky engagement
         }
 
         private void TryModelSwap(string npcName)
