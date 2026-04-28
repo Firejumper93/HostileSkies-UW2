@@ -64,6 +64,26 @@ namespace UW2Mod
         private bool godMode = false;
         private bool allVehiclesUnlocked = false;
         private float targetTimeScale = 1f;
+        private float savedFixedDeltaTime = -1f;
+
+        // === FLYBY CAMERA ===
+        private bool flybyCamActive = false;
+        private Transform flybyCamOrigParent = null;
+        private Vector3 flybyCamOrigLocalPos = Vector3.zero;
+        private Quaternion flybyCamOrigLocalRot = Quaternion.identity;
+        private GameObject flybyCamPivot = null;
+        private float flybyCamOrbitAngle = 0f;
+        private float flybyCamPitch = 15f;
+        private float flybyCamDistance = 25f;
+        private bool flybyCamAutoOrbit = true;
+        private float flybyCamAutoSpeed = 20f;
+        private int flybyCamMode = 0; // 0=orbit, 1=street view (stationary tracking)
+        private Vector3 flybyCamStreetPos = Vector3.zero;
+
+        // === AUTOPILOT ===
+        private bool autopilotActive = false;
+        private float autopilotOrigAutoRoll = -1f;
+        private float autopilotOrigAutoPitch = -1f;
         private float continuousBoost = 0f; // extra forward force per frame
         private float enginePowerMultiplier = 1f; // multiplier applied to live engines every frame
         private float dragMultiplier = 1f; // applied every frame to rigidbody drag (1 = normal, 0.5 = half, 0.25 = quarter)
@@ -167,6 +187,18 @@ namespace UW2Mod
         private float hsMusicVolume = 0.5f;
         private float originalBGMVolume = -1f; // -1 = not stored yet
 
+        // === AI CONFIG DUMP (one-shot per prefab type) ===
+        private HashSet<string> aiConfigDumpedPrefabs = new HashSet<string>();
+
+        // === BATTLEGROUPS (island defense activation) ===
+        private List<Il2CppActor.BattleGroup> sceneBattleGroups = new List<Il2CppActor.BattleGroup>();
+        private bool battleGroupsScanned = false;
+
+        // === WINGMEN ===
+        private List<GameObject> spawnedWingmen = new List<GameObject>();
+        private int maxWingmen => upgradeWingmen; // 0=locked, 1-4 wingmen based on upgrade tier
+        private float wingmanRetargetTimer = 0f;
+
         // === HOSTILE SKIES ===
         private bool hostileSkiesActive = false;
         private int threatLevel = 1;
@@ -217,6 +249,7 @@ namespace UW2Mod
         private int upgradeAmmoCapacity = 0;
         private int upgradeSpeed = 0;
         private int upgradeHandling = 0;
+        private int upgradeWingmen = 0;
         private Dictionary<string, float[]> origUpgradeValues = new Dictionary<string, float[]>(); // cache original values per aircraft
 
         // === WAVE MANAGEMENT ===
@@ -1541,8 +1574,14 @@ namespace UW2Mod
                 // Hostile Skies — zone-based combat encounters
                 try { UpdateHostileSkies(); } catch { }
 
+                // Wingman AI — retarget, cleanup
+                try { UpdateWingmen(); } catch { }
+
                 // Left trigger = secondary weapon (grenades) — Ace Combat style
                 try { UpdateSecondaryWeapon(); } catch { }
+
+                // Flyby camera orbit
+                try { UpdateFlybyCam(); } catch { }
 
                 // Telemetry logging (when HUD is active, log flight data periodically for post-session analysis)
                 if (showHUD)
@@ -2332,7 +2371,7 @@ namespace UW2Mod
                     else
                     {
                         hsState = HS_INACTIVE;
-                        ClearCombatants(); combatModeName = "OFF"; combatSpawnInterval = 0;
+                        ClearCombatants(); DismissAllWingmen(); DeactivateAllBattleGroups(); combatModeName = "OFF"; combatSpawnInterval = 0;
                         StopHSMusic();
                         ShowGameToast("HOSTILE SKIES DEACTIVATED", 3);
                     }
@@ -2385,13 +2424,112 @@ namespace UW2Mod
                 }
             });
 
+            // Slow motion
+            wristItems.Add(new WristItem {
+                DynamicLabel = () => targetTimeScale >= 1f ? "Slow-Mo: OFF" : $"Slow-Mo: {(int)(targetTimeScale * 100)}%",
+                OnActivate = () => {
+                    if (targetTimeScale >= 1f) SetSlowMo(0.5f, "50%");
+                    else if (targetTimeScale >= 0.5f) SetSlowMo(0.25f, "25%");
+                    else if (targetTimeScale >= 0.25f) SetSlowMo(0.1f, "10%");
+                    else SetSlowMo(1f, "Normal");
+                }
+            });
+
+            // Flyby camera
+            wristItems.Add(new WristItem {
+                DynamicLabel = () => flybyCamActive ? $"Flyby: {(flybyCamMode == 0 ? "ORBIT" : "STREET")}" : "Flyby Cam: OFF",
+                OnActivate = () => {
+                    if (!flybyCamActive) ToggleFlybyCam();
+                    else {
+                        // Cycle: orbit → street → off
+                        if (flybyCamMode == 0) {
+                            var ac = GameManager.ControllerAircraft;
+                            if (ac != null) {
+                                var cr = GameManager.CameraRoot;
+                                flybyCamStreetPos = cr != null ? cr.position : ac.transform.position + Vector3.up * 5f;
+                            }
+                            flybyCamMode = 1;
+                            SetStatus("Street View mode");
+                        } else {
+                            ToggleFlybyCam();
+                        }
+                    }
+                }
+            });
+
+            // Autopilot
+            wristItems.Add(new WristItem {
+                DynamicLabel = () => autopilotActive ? "Autopilot: ON" : "Autopilot: OFF",
+                OnActivate = () => ToggleAutopilot()
+            });
+
+            // Wingmen
+            wristItems.Add(new WristItem {
+                DynamicLabel = () => {
+                    if (upgradeWingmen == 0) return "Wingmen: LOCKED (buy upgrade)";
+                    return spawnedWingmen.Count > 0 ? $"Wingmen: {spawnedWingmen.Count}/{maxWingmen}" : $"Call Wingman (max {maxWingmen})";
+                },
+                OnActivate = () => {
+                    if (upgradeWingmen == 0) { SetStatus("Purchase Wingmen upgrade in the shop first!"); return; }
+                    if (!enemyPrefabsReady && cachedFighterPrefabs.Count == 0) { SetStatus("No prefabs — play a combat mission first"); return; }
+                    if (spawnedWingmen.Count >= maxWingmen) { DismissAllWingmen(); return; }
+                    SpawnWingman();
+                }
+            });
+
+            // BattleGroup activation (island defenses)
+            wristItems.Add(new WristItem {
+                DynamicLabel = () => {
+                    if (!battleGroupsScanned) return "Island Defenses: scanning...";
+                    int active = 0;
+                    for (int i = 0; i < sceneBattleGroups.Count; i++)
+                        try { if (sceneBattleGroups[i] != null && sceneBattleGroups[i].m_groupIsActive) active++; } catch { }
+                    return $"Island Defenses: {active}/{sceneBattleGroups.Count} active";
+                },
+                OnActivate = () => {
+                    if (!battleGroupsScanned || sceneBattleGroups.Count == 0)
+                    {
+                        SetStatus("No BattleGroups found — try flying near islands first");
+                        return;
+                    }
+                    // Toggle: if any active, deactivate all; otherwise activate all
+                    bool anyActive = false;
+                    for (int i = 0; i < sceneBattleGroups.Count; i++)
+                        try { if (sceneBattleGroups[i] != null && sceneBattleGroups[i].m_groupIsActive) { anyActive = true; break; } } catch { }
+                    if (anyActive)
+                    {
+                        int n = DeactivateAllBattleGroups();
+                        SetStatus($"Deactivated {n} island defense groups");
+                    }
+                    else
+                    {
+                        int n = ActivateAllBattleGroups();
+                        SetStatus($"Activated {n} island defense groups — they're targeting you!");
+                    }
+                }
+            });
+
+            // Reset speed only (safe — no stale refs)
+            wristItems.Add(new WristItem {
+                Label = ">> Reset Speed <<",
+                OnActivate = () => {
+                    if (flybyCamActive) try { ToggleFlybyCam(); } catch { }
+                    try { SetSlowMo(1f, "Normal"); } catch { }
+                    maxDragClamp = -1f; dragMultiplier = 1f; enginePowerMultiplier = 1f; continuousBoost = 0;
+                    SetStatus("Speed reset to stock");
+                }
+            });
+
             // Reset
             wristItems.Add(new WristItem {
                 Label = ">> RESET ALL <<",
                 OnActivate = () => {
+                    if (flybyCamActive) try { ToggleFlybyCam(); } catch { }
+                    try { SetSlowMo(1f, "Normal"); } catch { }
                     maxDragClamp = -1f; dragMultiplier = 1f; enginePowerMultiplier = 1f; continuousBoost = 0;
-                    ClearCombatants(); combatModeName = "OFF"; combatSpawnInterval = 0;
-                    ResetLiveAircraft();
+                    try { ClearCombatants(); } catch { }
+                    combatModeName = "OFF"; combatSpawnInterval = 0;
+                    // Skip ResetLiveAircraft — it crashes on stale config refs
                     SetStatus("All mods reset to stock");
                 }
             });
@@ -3313,6 +3451,112 @@ namespace UW2Mod
                 try { gameManager.m_unlockAllAircrafts = true; gameManager.m_unlockAllMissionCategories = true; gameManager.m_unlockAllMissionTypes = true; SetStatus("All missions unlocked"); }
                 catch (Exception ex) { SetStatus($"Failed: {ex.Message}"); }
             });
+
+            H($"--- SLOW MOTION [{(targetTimeScale >= 1f ? "OFF" : $"{(int)(targetTimeScale * 100)}%")}] ---");
+            B("Normal (100%)", () => SetSlowMo(1f, "Normal"));
+            B("Cinematic (50%)", () => SetSlowMo(0.5f, "Cinematic 50%"));
+            B("Dramatic (25%)", () => SetSlowMo(0.25f, "Dramatic 25%"));
+            B("Bullet Time (10%)", () => SetSlowMo(0.1f, "Bullet Time 10%"));
+            B("Near Freeze (5%)", () => SetSlowMo(0.05f, "Near Freeze 5%"));
+
+            H($"--- FLYBY CAMERA [{(flybyCamActive ? "ON" : "OFF")}] ---");
+            B(flybyCamActive ? "DISABLE Flyby Camera" : "ENABLE Flyby Camera", () => ToggleFlybyCam());
+            if (flybyCamActive)
+            {
+                string modeName = flybyCamMode == 0 ? "ORBIT" : "STREET VIEW";
+                H($"  Mode: {modeName} | Distance: {flybyCamDistance:F0}m | Pitch: {flybyCamPitch:F0}°");
+                H("  Keyboard: IJKL=orbit U/O=distance | Sticks=fly plane");
+                B($"Mode: {modeName}", () => {
+                    if (flybyCamMode == 0)
+                    {
+                        // Switch to street view — plant camera at current orbit position
+                        var ac = GameManager.ControllerAircraft;
+                        if (ac != null)
+                        {
+                            // Place camera where it currently is (orbit position)
+                            var camRoot = GameManager.CameraRoot;
+                            if (camRoot != null)
+                                flybyCamStreetPos = camRoot.position;
+                            else
+                                flybyCamStreetPos = ac.transform.position + Vector3.up * 2f + ac.transform.right * 30f;
+                        }
+                        flybyCamMode = 1;
+                        SetStatus("Street View — camera fixed, tracking plane");
+                    }
+                    else
+                    {
+                        flybyCamMode = 0;
+                        SetStatus("Orbit — camera circles the plane");
+                    }
+                });
+                if (flybyCamMode == 1)
+                {
+                    B("Set Viewpoint HERE", () => {
+                        var camRoot = GameManager.CameraRoot;
+                        if (camRoot != null)
+                        {
+                            // Plant camera at its current world position
+                            Vector3 pos = camRoot.position;
+                            // Make sure we're not underground
+                            RaycastHit hit;
+                            if (Physics.Raycast(new Vector3(pos.x, pos.y + 500f, pos.z), Vector3.down, out hit, 2000f))
+                            {
+                                if (pos.y < hit.point.y + 1.5f)
+                                    pos.y = hit.point.y + 1.5f; // lift above terrain
+                            }
+                            flybyCamStreetPos = pos;
+                        }
+                        SetStatus("Viewpoint set to current position");
+                    });
+                    B("Ground Level (below plane)", () => {
+                        var ac = GameManager.ControllerAircraft;
+                        if (ac != null)
+                        {
+                            Vector3 basePos = ac.transform.position - ac.transform.right * 40f;
+                            RaycastHit hit;
+                            if (Physics.Raycast(new Vector3(basePos.x, basePos.y + 500f, basePos.z), Vector3.down, out hit, 2000f))
+                                flybyCamStreetPos = hit.point + Vector3.up * 2f; // 2m above actual ground
+                            else
+                                flybyCamStreetPos = new Vector3(basePos.x, 5f, basePos.z); // fallback near sea level
+                            SetStatus("Street view: ground level");
+                        }
+                    });
+                    B("Elevated (island lookout)", () => {
+                        var ac = GameManager.ControllerAircraft;
+                        if (ac != null)
+                        {
+                            Vector3 basePos = ac.transform.position - ac.transform.right * 60f;
+                            RaycastHit hit;
+                            if (Physics.Raycast(new Vector3(basePos.x, basePos.y + 500f, basePos.z), Vector3.down, out hit, 2000f))
+                                flybyCamStreetPos = hit.point + Vector3.up * 30f; // 30m above terrain
+                            else
+                                flybyCamStreetPos = new Vector3(basePos.x, 80f, basePos.z); // fallback
+                            SetStatus("Street view: elevated lookout");
+                        }
+                    });
+                }
+                if (flybyCamMode == 0)
+                {
+                    B($"Auto Orbit [{(flybyCamAutoOrbit ? "ON" : "OFF")}]", () => {
+                        flybyCamAutoOrbit = !flybyCamAutoOrbit;
+                        SetStatus($"Auto orbit: {(flybyCamAutoOrbit ? "ON" : "OFF")}");
+                    });
+                    B($"Orbit Speed: {flybyCamAutoSpeed:F0}°/s", () => {
+                        flybyCamAutoSpeed += 10f;
+                        if (flybyCamAutoSpeed > 60f) flybyCamAutoSpeed = 5f;
+                        SetStatus($"Orbit speed: {flybyCamAutoSpeed:F0}°/s");
+                    });
+                }
+                B("Distance: Close (10m)", () => { flybyCamDistance = 10f; SetStatus("Distance: 10m"); });
+                B("Distance: Medium (25m)", () => { flybyCamDistance = 25f; SetStatus("Distance: 25m"); });
+                B("Distance: Far (60m)", () => { flybyCamDistance = 60f; SetStatus("Distance: 60m"); });
+                B("Distance: Epic (120m)", () => { flybyCamDistance = 120f; SetStatus("Distance: 120m"); });
+            }
+
+            H($"--- AUTOPILOT [{(autopilotActive ? "ON" : "OFF")}] ---");
+            B(autopilotActive ? "DISABLE Autopilot" : "ENABLE Autopilot", () => ToggleAutopilot());
+            if (autopilotActive)
+                H("  Plane flies level + gentle thrust. Sticks still override.");
         }
 
         private void BuildFlight()
@@ -3476,6 +3720,10 @@ namespace UW2Mod
             });
             B(UpgradeLabel("Handling (+15% response)", upgradeHandling), () => {
                 int temp = upgradeHandling; TryPurchaseUpgrade(ref upgradeHandling, "Handling");
+            });
+            B(UpgradeLabel("Wingmen (+1 per tier)", upgradeWingmen), () => {
+                TryPurchaseUpgrade(ref upgradeWingmen, "Wingmen");
+                if (upgradeWingmen > 0) SetStatus($"Wingmen unlocked! Max {upgradeWingmen} — use Call Wingman button");
             });
 
             // === SPEED PRESET ===
@@ -4590,6 +4838,68 @@ namespace UW2Mod
             }
         }
 
+        private void LogAiConfig(string label, Il2CppAi.AiAircraftController aiCtrl)
+        {
+            try
+            {
+                LoggerInstance.Msg($"[AI-CFG] === {label} ===");
+                LoggerInstance.Msg($"[AI-CFG]   state={aiCtrl.m_aiState} desired={aiCtrl.m_desiredAiState} hasWeapons={aiCtrl.HasWeaponSystems}");
+
+                var patrol = aiCtrl.m_aiAircraftConfigPatrol;
+                if (patrol != null)
+                {
+                    LoggerInstance.Msg($"[AI-CFG]   PATROL config '{patrol.name}':");
+                    LoggerInstance.Msg($"[AI-CFG]     leadTarget={patrol.m_leadTarget} leadAmount={patrol.m_leadAmount:F2}");
+                    LoggerInstance.Msg($"[AI-CFG]     maxPitch={patrol.m_maxPitchAngle:F1} maxRoll={patrol.m_maxRollAngle:F1}");
+                    LoggerInstance.Msg($"[AI-CFG]     rollThresh={patrol.m_rollInputThreshold:F2} pitchThresh={patrol.m_pitchInputThreshold:F2} yawThresh={patrol.m_yawInputThreshold:F2}");
+                    LoggerInstance.Msg($"[AI-CFG]     lateralWander={patrol.m_lateralWanderDistance:F1} wanderSpeed={patrol.m_lateralWanderSpeed:F2}");
+                    LoggerInstance.Msg($"[AI-CFG]     speedThreshold={patrol.m_speedThreshold:F1} minimumInput={patrol.m_minimumInput:F2}");
+                    LoggerInstance.Msg($"[AI-CFG]     swerveDistance={patrol.m_swerveDistance:F1}");
+                    LoggerInstance.Msg($"[AI-CFG]     canLoseLOS={patrol.m_canLoseLineOfSite} outOfSightAngle={patrol.m_outOfSightAngle:F1} outOfSightTime={patrol.m_outOfSightTime:F1} outOfSightDist={patrol.m_outOfSightDistance:F1}");
+                    LoggerInstance.Msg($"[AI-CFG]     isCloseDist={patrol.m_isCloseDistace:F1} isCloseTimeout={patrol.m_isCloseTimeout:F1}");
+                    LoggerInstance.Msg($"[AI-CFG]     combatFloor={patrol.m_combatFloor:F1} floorHeight={patrol.m_floorHeight:F1} resumeHeight={patrol.m_resumeHeight:F1}");
+                    LoggerInstance.Msg($"[AI-CFG]     takeoffHeight={patrol.m_takeoffHeight:F1} additionalPitchOnRoll={patrol.m_additionalPitchOnRoll:F2}");
+                    LoggerInstance.Msg($"[AI-CFG]     onDamageResumeAttack={patrol.m_onDamageResumeAttack:F2}");
+                    LoggerInstance.Msg($"[AI-CFG]     distancingMethod={patrol.m_targetDistancingMethod}");
+                    LoggerInstance.Msg($"[AI-CFG]     closeOffsetMin={patrol.m_isClosePositionOffsetMin} closeOffsetMax={patrol.m_isClosePositionOffsetMax}");
+                }
+                else LoggerInstance.Msg("[AI-CFG]   PATROL config: NULL");
+
+                var attack = aiCtrl.m_aiAircraftConfigAttack;
+                if (attack != null)
+                {
+                    LoggerInstance.Msg($"[AI-CFG]   ATTACK config '{attack.name}':");
+                    LoggerInstance.Msg($"[AI-CFG]     leadTarget={attack.m_leadTarget} leadAmount={attack.m_leadAmount:F2}");
+                    LoggerInstance.Msg($"[AI-CFG]     maxPitch={attack.m_maxPitchAngle:F1} maxRoll={attack.m_maxRollAngle:F1}");
+                    LoggerInstance.Msg($"[AI-CFG]     rollThresh={attack.m_rollInputThreshold:F2} pitchThresh={attack.m_pitchInputThreshold:F2} yawThresh={attack.m_yawInputThreshold:F2}");
+                    LoggerInstance.Msg($"[AI-CFG]     lateralWander={attack.m_lateralWanderDistance:F1} wanderSpeed={attack.m_lateralWanderSpeed:F2}");
+                    LoggerInstance.Msg($"[AI-CFG]     speedThreshold={attack.m_speedThreshold:F1} minimumInput={attack.m_minimumInput:F2}");
+                    LoggerInstance.Msg($"[AI-CFG]     swerveDistance={attack.m_swerveDistance:F1}");
+                    LoggerInstance.Msg($"[AI-CFG]     canLoseLOS={attack.m_canLoseLineOfSite} outOfSightAngle={attack.m_outOfSightAngle:F1} outOfSightTime={attack.m_outOfSightTime:F1} outOfSightDist={attack.m_outOfSightDistance:F1}");
+                    LoggerInstance.Msg($"[AI-CFG]     isCloseDist={attack.m_isCloseDistace:F1} isCloseTimeout={attack.m_isCloseTimeout:F1}");
+                    LoggerInstance.Msg($"[AI-CFG]     combatFloor={attack.m_combatFloor:F1} floorHeight={attack.m_floorHeight:F1} resumeHeight={attack.m_resumeHeight:F1}");
+                    LoggerInstance.Msg($"[AI-CFG]     takeoffHeight={attack.m_takeoffHeight:F1} additionalPitchOnRoll={attack.m_additionalPitchOnRoll:F2}");
+                    LoggerInstance.Msg($"[AI-CFG]     onDamageResumeAttack={attack.m_onDamageResumeAttack:F2}");
+                    LoggerInstance.Msg($"[AI-CFG]     distancingMethod={attack.m_targetDistancingMethod}");
+                    LoggerInstance.Msg($"[AI-CFG]     closeOffsetMin={attack.m_isClosePositionOffsetMin} closeOffsetMax={attack.m_isClosePositionOffsetMax}");
+                }
+                else LoggerInstance.Msg("[AI-CFG]   ATTACK config: NULL");
+
+                // Also log the aircraft physics if available
+                try
+                {
+                    var aircraftCtrl = aiCtrl.m_aircraftController;
+                    if (aircraftCtrl != null)
+                    {
+                        var rb = aircraftCtrl.gameObject.GetComponent<Rigidbody>();
+                        LoggerInstance.Msg($"[AI-CFG]   Aircraft: '{aircraftCtrl.gameObject.name}' mass={rb?.mass ?? -1:F1} drag={rb?.drag ?? -1:F3}");
+                    }
+                }
+                catch { }
+            }
+            catch (Exception ex) { LoggerInstance.Msg($"[AI-CFG] LogAiConfig error: {ex.Message}"); }
+        }
+
         private void SpawnEnemyFighter(Vector3 spawnPos)
         {
             // Pick a prefab — prefer messer, fall back to wolf
@@ -4619,62 +4929,69 @@ namespace UW2Mod
                 try { playerTarget = ac.gameObject.GetComponentInChildren<Il2CppActor.Targetable>(true); } catch { }
                 try { if (playerTarget == null) { var rta = ac.gameObject.GetComponentInChildren<RigidTargetableAircraft>(true); if (rta != null) playerTarget = rta.TryCast<Il2CppActor.Targetable>(); } } catch { }
 
-                // === PRIMARY: Use AirDefenseEnemyAIController (the game's own enemy wrapper) ===
+                // === AI INITIALIZATION (Ghidra-verified flow) ===
+                // SetTarget() internally sets attack state + resets weapons — don't duplicate those calls
+                // _InitializeFlightAndTargeting() sets up physics controller ref that clones lack
+                // AllowAttack() is separate — sets per-weapon fire permission flags at offset 0x225
+                var playerITargetable = ac.TryCast<Il2CppActor.ITargetable>();
+
                 var defAI = clone.GetComponentInChildren<Il2CppGameplay.Defense.AirDefenseEnemyAIController>(true);
                 if (defAI != null)
                 {
                     LoggerInstance.Msg($"[COMBAT]   AirDefenseEnemyAIController found on '{clone.name}'");
 
-                    // Set target to player
-                    if (playerTarget != null)
-                    {
-                        try { defAI.SetTarget(playerTarget); LoggerInstance.Msg("[COMBAT]   SetTarget → player"); } catch (Exception ex) { LoggerInstance.Msg($"[COMBAT]   SetTarget failed: {ex.Message}"); }
-                    }
-
-                    // Allow attack and initiate
-                    try { defAI.AllowAttack(true); LoggerInstance.Msg("[COMBAT]   AllowAttack(true)"); } catch (Exception ex) { LoggerInstance.Msg($"[COMBAT]   AllowAttack failed: {ex.Message}"); }
-                    try { defAI.AttackDesignatedTarget(); LoggerInstance.Msg("[COMBAT]   AttackDesignatedTarget()"); } catch (Exception ex) { LoggerInstance.Msg($"[COMBAT]   AttackDesignatedTarget failed: {ex.Message}"); }
-
-                    // Also configure the underlying AiAircraftController directly
                     var aiCtrl = defAI.AIController;
                     if (aiCtrl != null)
                     {
-                        LoggerInstance.Msg($"[COMBAT]   AiAircraftController: state={aiCtrl.m_aiState} desired={aiCtrl.m_desiredAiState} hasWeapons={aiCtrl.HasWeaponSystems}");
+                        // Step 1: Init flight systems (sets physics controller ref, weapon count, layer mask)
+                        try { aiCtrl._InitializeFlightAndTargeting(); LoggerInstance.Msg("[COMBAT]   _InitializeFlightAndTargeting() OK"); }
+                        catch (Exception ex) { LoggerInstance.Msg($"[COMBAT]   _InitializeFlightAndTargeting: {ex.Message}"); }
 
-                        // Set ALL targeting references
+                        // Dump AI config once per prefab type (for tuning reference)
+                        string prefabKey = prefab.name ?? "unknown";
+                        if (!aiConfigDumpedPrefabs.Contains(prefabKey))
+                        {
+                            aiConfigDumpedPrefabs.Add(prefabKey);
+                            LogAiConfig($"STOCK CONFIG — {prefabKey}", aiCtrl);
+                        }
+
+                        // Step 2: Set aircraft lead reference for aim prediction
                         var playerLead = ac.m_aircraftLead;
                         if (playerLead != null)
                         {
-                            try { aiCtrl.m_targetAircraftLead = playerLead; LoggerInstance.Msg("[COMBAT]   m_targetAircraftLead set"); } catch { }
+                            try { aiCtrl.m_targetAircraftLead = playerLead; } catch { }
                         }
 
-                        // Set ITargetable references — this is what the flight AI actually chases
-                        var playerITargetable = ac.TryCast<Il2CppActor.ITargetable>();
+                        // Step 3: SetTarget — this is the big one. Ghidra shows it internally:
+                        //   - Stores target at 0x88, gets aim point component
+                        //   - Resets all FiringMechanisms
+                        //   - Sets m_desiredAiState = Attack AND m_currentAiState = Attack
                         if (playerITargetable != null)
                         {
-                            try { aiCtrl.m_iTargetableTarget = playerITargetable; LoggerInstance.Msg("[COMBAT]   m_iTargetableTarget set"); } catch { }
+                            try { aiCtrl.SetTarget(playerITargetable); LoggerInstance.Msg("[COMBAT]   SetTarget → player (sets attack state + resets weapons)"); }
+                            catch (Exception ex) { LoggerInstance.Msg($"[COMBAT]   SetTarget: {ex.Message}"); }
                         }
 
-                        // Set flyToPosition to player's current position as initial target
-                        try { aiCtrl.m_flyToPosition = ac.transform.position; LoggerInstance.Msg("[COMBAT]   m_flyToPosition set to player pos"); } catch { }
-
-                        // Set the ITargetable via SetTarget method too
-                        try { aiCtrl.SetTarget(playerITargetable); LoggerInstance.Msg("[COMBAT]   SetTarget(player)"); } catch (Exception ex) { LoggerInstance.Msg($"[COMBAT]   SetTarget: {ex.Message}"); }
-
-                        try { aiCtrl.SetDesiredAiState(Il2CppAi.AI_STATE.Attack, playerITargetable); } catch { }
+                        // Step 4: AllowAttack — separate from SetTarget, sets fire permission on each weapon
                         try { aiCtrl.AllowAttack(true); } catch { }
-                        try { aiCtrl.ResetWeaponSystems(true); } catch { }
 
-                        LoggerInstance.Msg($"[COMBAT]   Post-config: state={aiCtrl.m_aiState} desired={aiCtrl.m_desiredAiState}");
+                        // Step 5: Set initial fly-to position so AI has somewhere to go immediately
+                        try { aiCtrl.m_flyToPosition = ac.transform.position; } catch { }
 
-                        // Log current fly-to position and target info
-                        try { LoggerInstance.Msg($"[COMBAT]   flyToPos=({aiCtrl.m_flyToPosition.x:F0},{aiCtrl.m_flyToPosition.y:F0},{aiCtrl.m_flyToPosition.z:F0})"); } catch { }
-                        try { LoggerInstance.Msg($"[COMBAT]   iTargetableTarget={aiCtrl.m_iTargetableTarget != null} targetLead={aiCtrl.m_targetAircraftLead != null}"); } catch { }
+                        LoggerInstance.Msg($"[COMBAT]   Post-init: state={aiCtrl.m_aiState} desired={aiCtrl.m_desiredAiState} hasWeapons={aiCtrl.HasWeaponSystems}");
                     }
                     else
                     {
                         LoggerInstance.Msg("[COMBAT]   WARNING: defAI.AIController is null");
                     }
+
+                    // Also call the wrapper's attack method
+                    if (playerTarget != null)
+                    {
+                        try { defAI.SetTarget(playerTarget); } catch { }
+                    }
+                    try { defAI.AllowAttack(true); } catch { }
+                    try { defAI.AttackDesignatedTarget(); } catch { }
                 }
                 else
                 {
@@ -4683,11 +5000,12 @@ namespace UW2Mod
                     var aiCtrl = clone.GetComponentInChildren<Il2CppAi.AiAircraftController>(true);
                     if (aiCtrl != null)
                     {
+                        try { aiCtrl._InitializeFlightAndTargeting(); } catch { }
                         var playerLead = ac.m_aircraftLead;
-                        if (playerLead != null) aiCtrl.m_targetAircraftLead = playerLead;
-                        try { aiCtrl.SetDesiredAiState(Il2CppAi.AI_STATE.Attack, ac.TryCast<Il2CppActor.ITargetable>()); } catch { }
+                        if (playerLead != null) try { aiCtrl.m_targetAircraftLead = playerLead; } catch { }
+                        if (playerITargetable != null) try { aiCtrl.SetTarget(playerITargetable); } catch { }
                         try { aiCtrl.AllowAttack(true); } catch { }
-                        try { aiCtrl.ResetWeaponSystems(true); } catch { }
+                        try { aiCtrl.m_flyToPosition = ac.transform.position; } catch { }
                         LoggerInstance.Msg($"[COMBAT]   Direct AI config: state={aiCtrl.m_aiState}");
                     }
                     else
@@ -4773,15 +5091,47 @@ namespace UW2Mod
                 {
                     var fms = clone.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(true);
                     LoggerInstance.Msg($"[COMBAT]   FiringMechanisms: {fms?.Length ?? 0}");
+                    var ownerTargetable = clone.GetComponentInChildren<Il2CppActor.ITargetable>(true);
                     for (int f = 0; f < (fms?.Length ?? 0); f++)
                     {
                         fms[f].gameObject.SetActive(true);
                         fms[f].m_isEnabled = true;
                         var fm = fms[f].TryCast<Il2CppWeapon.FiringMechanism>();
                         if (fm != null) fm.m_isInfiniteAmmo = true;
+                        // Set weapon owner for kill attribution (Ghidra: never called on spawned enemies)
+                        if (ownerTargetable != null)
+                            try { fms[f].SetOwnerForSinglePlayerModule(ownerTargetable); } catch { }
                     }
+                    if (ownerTargetable != null) LoggerInstance.Msg("[COMBAT]   SetOwnerForSinglePlayerModule OK");
                 }
                 catch { }
+
+                // === Register with CombatNetwork (Ghidra: Join checks IsActive first, safe to call) ===
+                try
+                {
+                    if (Il2CppTargetableSystem.CombatNetwork.IsActive())
+                    {
+                        // Register as ITargetableSimple (adds to hit list — player can target/damage it)
+                        var cloneTargetable = clone.GetComponentInChildren<Il2CppActor.ITargetableSimple>(true);
+                        if (cloneTargetable != null)
+                        {
+                            Il2CppTargetableSystem.CombatNetwork.Join(cloneTargetable);
+                            LoggerInstance.Msg("[COMBAT]   CombatNetwork.Join(ITargetableSimple) OK");
+                        }
+                        // Also register as ICombatant if available (adds to allied/enemy combatant lists)
+                        var cloneCombatant = clone.GetComponentInChildren<Il2CppTargetableSystem.ICombatant>(true);
+                        if (cloneCombatant != null)
+                        {
+                            Il2CppTargetableSystem.CombatNetwork.Join(cloneCombatant);
+                            LoggerInstance.Msg("[COMBAT]   CombatNetwork.Join(ICombatant) OK");
+                        }
+                    }
+                    else
+                    {
+                        LoggerInstance.Msg("[COMBAT]   CombatNetwork not active — enemy won't be in combat registry");
+                    }
+                }
+                catch (Exception ex) { LoggerInstance.Msg($"[COMBAT]   CombatNetwork.Join: {ex.Message}"); }
 
                 spawnedCombatants.Add(clone);
                 combatActiveFighters = spawnedCombatants.Count;
@@ -4874,12 +5224,15 @@ namespace UW2Mod
                 try
                 {
                     var fms = clone.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(true);
+                    var ownerTargetable = clone.GetComponentInChildren<Il2CppActor.ITargetable>(true);
                     for (int f = 0; f < (fms?.Length ?? 0); f++)
                     {
                         fms[f].gameObject.SetActive(true);
                         fms[f].m_isEnabled = true;
                         var fm = fms[f].TryCast<Il2CppWeapon.FiringMechanism>();
                         if (fm != null) fm.m_isInfiniteAmmo = true;
+                        if (ownerTargetable != null)
+                            try { fms[f].SetOwnerForSinglePlayerModule(ownerTargetable); } catch { }
                     }
                     LoggerInstance.Msg($"[COMBAT]   FiringMechanisms: {fms?.Length ?? 0}");
                 }
@@ -4962,12 +5315,15 @@ namespace UW2Mod
                 try
                 {
                     var fms = clone.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(true);
+                    var ownerTargetable = clone.GetComponentInChildren<Il2CppActor.ITargetable>(true);
                     for (int f = 0; f < (fms?.Length ?? 0); f++)
                     {
                         fms[f].gameObject.SetActive(true);
                         fms[f].m_isEnabled = true;
                         var fm = fms[f].TryCast<Il2CppWeapon.FiringMechanism>();
                         if (fm != null) fm.m_isInfiniteAmmo = true;
+                        if (ownerTargetable != null)
+                            try { fms[f].SetOwnerForSinglePlayerModule(ownerTargetable); } catch { }
                     }
                     LoggerInstance.Msg($"[COMBAT]   Ship FiringMechanisms: {fms?.Length ?? 0}");
                 }
@@ -5537,6 +5893,18 @@ namespace UW2Mod
                 {
                     if (spawnedCombatants[i] != null)
                     {
+                        // Unregister from CombatNetwork before destroying
+                        try
+                        {
+                            if (Il2CppTargetableSystem.CombatNetwork.IsActive())
+                            {
+                                var ts = spawnedCombatants[i].GetComponentInChildren<Il2CppActor.ITargetableSimple>(true);
+                                if (ts != null) Il2CppTargetableSystem.CombatNetwork.Leave(ts);
+                                var cb = spawnedCombatants[i].GetComponentInChildren<Il2CppTargetableSystem.ICombatant>(true);
+                                if (cb != null) Il2CppTargetableSystem.CombatNetwork.Leave(cb);
+                            }
+                        }
+                        catch { }
                         UnityEngine.Object.Destroy(spawnedCombatants[i]);
                         cleared++;
                     }
@@ -5548,6 +5916,277 @@ namespace UW2Mod
             combatActiveFighters = 0;
             combatSpawnTimer = 0f;
             if (cleared > 0) LoggerInstance.Msg($"[COMBAT] Cleared {cleared} combatants");
+        }
+
+        // ================================================================
+        // WINGMAN SYSTEM
+        // ================================================================
+        private void SpawnWingman()
+        {
+            GameObject prefab = null;
+            if (IsValidCachedPrefab(cachedEnemyWolf)) prefab = cachedEnemyWolf;
+            else if (IsValidCachedPrefab(cachedEnemyMesser)) prefab = cachedEnemyMesser;
+            if (prefab == null) { SetStatus("No wingman prefabs available"); return; }
+
+            try
+            {
+                var ac = GameManager.ControllerAircraft;
+                if (ac == null) { SetStatus("Not in aircraft"); return; }
+
+                // Spawn off the player's wing
+                int wingIdx = spawnedWingmen.Count;
+                float side = (wingIdx % 2 == 0) ? -1f : 1f;
+                Vector3 offset = ac.transform.right * side * 30f + ac.transform.forward * -20f + Vector3.up * 5f;
+                Vector3 spawnPos = ac.transform.position + offset;
+
+                var clone = UnityEngine.Object.Instantiate(prefab);
+                clone.name = "HS_Wingman_" + UnityEngine.Random.Range(1000, 9999);
+                clone.transform.position = spawnPos;
+                clone.transform.rotation = ac.transform.rotation;
+                clone.SetActive(true);
+
+                // Get player's ITargetable (wingman protects the player)
+                var playerITargetable = ac.TryCast<Il2CppActor.ITargetable>();
+
+                var aiCtrl = clone.GetComponentInChildren<Il2CppAi.AiAircraftController>(true);
+                if (aiCtrl != null)
+                {
+                    // Init flight systems (Ghidra-verified: sets physics controller ref)
+                    try { aiCtrl._InitializeFlightAndTargeting(); } catch { }
+
+                    // Set affiliation to ALLY
+                    var acCtrl = clone.GetComponentInChildren<Il2CppAi.AircraftController>(true);
+                    if (acCtrl != null)
+                    {
+                        try { acCtrl.m_affiliation = Il2CppTargetableSystem.Affiliation.Ally; } catch { }
+                    }
+
+                    // If enemies exist, target the nearest one. Otherwise, follow player.
+                    ITargetableRetargetWingman(aiCtrl, ac);
+
+                    // Allow attack
+                    try { aiCtrl.AllowAttack(true); } catch { }
+                    try { aiCtrl.m_flyToPosition = ac.transform.position + ac.transform.forward * 50f; } catch { }
+
+                    LoggerInstance.Msg($"[WINGMAN] Spawned '{clone.name}' state={aiCtrl.m_aiState} hasWeapons={aiCtrl.HasWeaponSystems}");
+                }
+
+                // Set up weapons
+                try
+                {
+                    var fms = clone.GetComponentsInChildren<Il2CppWeapon.FiringMechanismBase>(true);
+                    var ownerTargetable = clone.GetComponentInChildren<Il2CppActor.ITargetable>(true);
+                    for (int f = 0; f < (fms?.Length ?? 0); f++)
+                    {
+                        fms[f].gameObject.SetActive(true);
+                        fms[f].m_isEnabled = true;
+                        var fm = fms[f].TryCast<Il2CppWeapon.FiringMechanism>();
+                        if (fm != null) fm.m_isInfiniteAmmo = true;
+                        if (ownerTargetable != null)
+                            try { fms[f].SetOwnerForSinglePlayerModule(ownerTargetable); } catch { }
+                    }
+                }
+                catch { }
+
+                // Activate AI weapons
+                try
+                {
+                    var aiWeapons = clone.GetComponentsInChildren<Il2CppAi.AiAircraftWeapon>(true);
+                    for (int w = 0; w < (aiWeapons?.Length ?? 0); w++)
+                    {
+                        aiWeapons[w].IsActive = true;
+                        aiWeapons[w].gameObject.SetActive(true);
+                    }
+                }
+                catch { }
+
+                // Rigidbody — match player velocity
+                var rb = clone.GetComponent<Rigidbody>();
+                if (rb != null)
+                {
+                    rb.isKinematic = false;
+                    rb.useGravity = false;
+                    var playerRb = ac.GetComponent<Rigidbody>();
+                    rb.velocity = playerRb != null ? playerRb.velocity : clone.transform.forward * 50f;
+                }
+
+                // Register with CombatNetwork as ALLY
+                try
+                {
+                    if (Il2CppTargetableSystem.CombatNetwork.IsActive())
+                    {
+                        var ts = clone.GetComponentInChildren<Il2CppActor.ITargetableSimple>(true);
+                        if (ts != null) Il2CppTargetableSystem.CombatNetwork.Join(ts);
+                        var cb = clone.GetComponentInChildren<Il2CppTargetableSystem.ICombatant>(true);
+                        if (cb != null) Il2CppTargetableSystem.CombatNetwork.Join(cb);
+                        LoggerInstance.Msg("[WINGMAN]   Registered with CombatNetwork (Ally)");
+                    }
+                }
+                catch { }
+
+                spawnedWingmen.Add(clone);
+                SetStatus($"Wingman deployed! ({spawnedWingmen.Count}/{maxWingmen})");
+                ShowGameToast($"WINGMAN {spawnedWingmen.Count} ON STATION", 3);
+            }
+            catch (Exception ex)
+            {
+                LoggerInstance.Error($"[WINGMAN] Spawn failed: {ex}");
+                SetStatus($"Wingman failed: {ex.Message}");
+            }
+        }
+
+        private void ITargetableRetargetWingman(Il2CppAi.AiAircraftController aiCtrl, Il2Cpp.ControllerAircraft playerAc)
+        {
+            // Find nearest enemy for wingman to attack
+            Il2CppActor.ITargetable enemyTarget = null;
+
+            // First try CombatNetwork
+            try
+            {
+                if (Il2CppTargetableSystem.CombatNetwork.IsActive() &&
+                    Il2CppTargetableSystem.CombatNetwork.CountCombatants(Il2CppTargetableSystem.Affiliation.Enemy) > 0)
+                {
+                    var sorted = Il2CppTargetableSystem.CombatNetwork.GetCombatantsSortedByDistance(
+                        Il2CppTargetableSystem.Affiliation.Enemy, aiCtrl.transform);
+                    if (sorted != null && sorted.Count > 0)
+                    {
+                        // Pick a random enemy from the closest 3 to spread wingmen across targets
+                        int pick = UnityEngine.Random.Range(0, Math.Min(3, sorted.Count));
+                        var combatant = sorted[pick];
+                        if (combatant != null)
+                        {
+                            enemyTarget = combatant.TryCast<Il2CppActor.ITargetable>();
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            // Fallback: scan spawned combatants list
+            if (enemyTarget == null)
+            {
+                float bestDist = float.MaxValue;
+                for (int i = 0; i < spawnedCombatants.Count; i++)
+                {
+                    try
+                    {
+                        if (spawnedCombatants[i] == null || !spawnedCombatants[i].activeSelf) continue;
+                        float d = Vector3.Distance(aiCtrl.transform.position, spawnedCombatants[i].transform.position);
+                        if (d < bestDist)
+                        {
+                            var t = spawnedCombatants[i].GetComponentInChildren<Il2CppActor.ITargetable>(true);
+                            if (t != null) { enemyTarget = t; bestDist = d; }
+                        }
+                    }
+                    catch { }
+                }
+            }
+
+            if (enemyTarget != null)
+            {
+                try { aiCtrl.SetTarget(enemyTarget); } catch { }
+                LoggerInstance.Msg("[WINGMAN]   Targeting enemy");
+            }
+            else
+            {
+                // No enemies — follow player
+                try
+                {
+                    var playerTarget = playerAc.TryCast<Il2CppActor.ITargetable>();
+                    if (playerTarget != null)
+                    {
+                        aiCtrl.SetDesiredAiState(Il2CppAi.AI_STATE.Patrol, playerTarget);
+                        aiCtrl.m_flyToPosition = playerAc.transform.position + playerAc.transform.forward * 100f;
+                    }
+                }
+                catch { }
+                LoggerInstance.Msg("[WINGMAN]   No enemies — following player");
+            }
+        }
+
+        private void UpdateWingmen()
+        {
+            // Clean up dead wingmen
+            for (int i = spawnedWingmen.Count - 1; i >= 0; i--)
+            {
+                try
+                {
+                    if (spawnedWingmen[i] == null || !spawnedWingmen[i].activeSelf)
+                    {
+                        LoggerInstance.Msg($"[WINGMAN] Wingman {i} lost!");
+                        spawnedWingmen.RemoveAt(i);
+                    }
+                }
+                catch { spawnedWingmen.RemoveAt(i); }
+            }
+
+            if (spawnedWingmen.Count == 0) return;
+
+            // Retarget wingmen every 5 seconds
+            wingmanRetargetTimer += Time.deltaTime;
+            if (wingmanRetargetTimer < 5f) return;
+            wingmanRetargetTimer = 0f;
+
+            var ac = GameManager.ControllerAircraft;
+            if (ac == null) return;
+
+            for (int i = 0; i < spawnedWingmen.Count; i++)
+            {
+                try
+                {
+                    var aiCtrl = spawnedWingmen[i].GetComponentInChildren<Il2CppAi.AiAircraftController>(true);
+                    if (aiCtrl == null) continue;
+
+                    // Check if current target is still alive
+                    var currentTarget = aiCtrl.GetCurrentTarget();
+                    bool needsRetarget = currentTarget == null;
+
+                    if (!needsRetarget)
+                    {
+                        // Check if target object is still valid
+                        try
+                        {
+                            var targetObj = currentTarget.TryCast<UnityEngine.Component>();
+                            if (targetObj == null || targetObj.gameObject == null || !targetObj.gameObject.activeSelf)
+                                needsRetarget = true;
+                        }
+                        catch { needsRetarget = true; }
+                    }
+
+                    if (needsRetarget)
+                        ITargetableRetargetWingman(aiCtrl, ac);
+                }
+                catch { }
+            }
+        }
+
+        private void DismissAllWingmen()
+        {
+            for (int i = spawnedWingmen.Count - 1; i >= 0; i--)
+            {
+                try
+                {
+                    if (spawnedWingmen[i] != null)
+                    {
+                        try
+                        {
+                            if (Il2CppTargetableSystem.CombatNetwork.IsActive())
+                            {
+                                var ts = spawnedWingmen[i].GetComponentInChildren<Il2CppActor.ITargetableSimple>(true);
+                                if (ts != null) Il2CppTargetableSystem.CombatNetwork.Leave(ts);
+                                var cb = spawnedWingmen[i].GetComponentInChildren<Il2CppTargetableSystem.ICombatant>(true);
+                                if (cb != null) Il2CppTargetableSystem.CombatNetwork.Leave(cb);
+                            }
+                        }
+                        catch { }
+                        UnityEngine.Object.Destroy(spawnedWingmen[i]);
+                    }
+                }
+                catch { }
+            }
+            spawnedWingmen.Clear();
+            SetStatus("Wingmen dismissed");
+            LoggerInstance.Msg("[WINGMAN] All wingmen dismissed");
         }
 
         private void UpdateCombatSpawner()
@@ -6752,6 +7391,7 @@ namespace UW2Mod
                 lines.Add($"upgradeAmmoCapacity={upgradeAmmoCapacity}");
                 lines.Add($"upgradeSpeed={upgradeSpeed}");
                 lines.Add($"upgradeHandling={upgradeHandling}");
+                lines.Add($"upgradeWingmen={upgradeWingmen}");
                 lines.Add($"explosiveAmmoUnlocked={explosiveAmmoUnlocked}");
                 lines.Add($"activeSpeedPreset={activeSpeedPreset}");
                 lines.Add($"secondaryWeaponType={secondaryWeaponType}");
@@ -6802,6 +7442,7 @@ namespace UW2Mod
                     if (line.StartsWith("upgradeAmmoCapacity=")) int.TryParse(line.Substring(20), out upgradeAmmoCapacity);
                     if (line.StartsWith("upgradeSpeed=")) int.TryParse(line.Substring(13), out upgradeSpeed);
                     if (line.StartsWith("upgradeHandling=")) int.TryParse(line.Substring(16), out upgradeHandling);
+                    if (line.StartsWith("upgradeWingmen=")) int.TryParse(line.Substring(15), out upgradeWingmen);
                     if (line.StartsWith("explosiveAmmoUnlocked=")) explosiveAmmoUnlocked = line.Contains("True");
                     if (line.StartsWith("activeSpeedPreset=")) int.TryParse(line.Substring(18), out activeSpeedPreset);
                     if (line.StartsWith("secondaryWeaponType=")) int.TryParse(line.Substring(20), out secondaryWeaponType);
@@ -6817,6 +7458,7 @@ namespace UW2Mod
                 upgradeAmmoCapacity = Math.Max(0, Math.Min(upgradeAmmoCapacity, 4));
                 upgradeSpeed = Math.Max(0, Math.Min(upgradeSpeed, 4));
                 upgradeHandling = Math.Max(0, Math.Min(upgradeHandling, 4));
+                upgradeWingmen = Math.Max(0, Math.Min(upgradeWingmen, 4));
                 activeSpeedPreset = Math.Max(0, Math.Min(activeSpeedPreset, speedPresetNames.Length - 1));
                 threatLevelUnlocked = Math.Max(1, Math.Min(threatLevelUnlocked, 5));
                 if (scrap < 0) scrap = 0;
@@ -6907,8 +7549,40 @@ namespace UW2Mod
             }
             catch (Exception ex) { LoggerInstance.Msg($"[HOSTILE] Island scan: {ex.Message}"); }
 
+            // === Scan for BattleGroups in scene ===
+            try
+            {
+                sceneBattleGroups.Clear();
+                var bgs = Resources.FindObjectsOfTypeAll<Il2CppActor.BattleGroup>();
+                LoggerInstance.Msg($"[HOSTILE] BattleGroup scan: {bgs?.Length ?? 0} found");
+                for (int i = 0; i < (bgs?.Length ?? 0); i++)
+                {
+                    var bg = bgs[i];
+                    if (bg == null) continue;
+                    sceneBattleGroups.Add(bg);
+                    int radars = bg.m_radarControllers?.Length ?? 0;
+                    int turrets = bg.m_turretControllers?.Length ?? 0;
+                    int aircraft = bg.m_aiAircraft?.Length ?? 0;
+                    Vector3 pos = bg.transform.position;
+                    LoggerInstance.Msg($"[HOSTILE]   BG[{i}]: '{bg.gameObject.name}' pos=({pos.x:F0},{pos.y:F0},{pos.z:F0}) radars={radars} turrets={turrets} ai={aircraft} active={bg.m_groupIsActive}");
+
+                    // Map to nearest zone
+                    string nearestZone = "none";
+                    float nearestDist = float.MaxValue;
+                    foreach (var z in combatZones)
+                    {
+                        float d = Vector3.Distance(pos, z.Position);
+                        if (d < nearestDist) { nearestDist = d; nearestZone = z.Name; }
+                    }
+                    if (nearestDist < 2000f)
+                        LoggerInstance.Msg($"[HOSTILE]     → nearest zone: '{nearestZone}' ({nearestDist:F0}m)");
+                }
+                battleGroupsScanned = true;
+            }
+            catch (Exception ex) { LoggerInstance.Msg($"[HOSTILE] BattleGroup scan: {ex.Message}"); }
+
             zonesInitialized = true; // always mark done, even if 0 found — prevents per-frame rescan
-            LoggerInstance.Msg($"[HOSTILE] Zones initialized: {combatZones.Count} total");
+            LoggerInstance.Msg($"[HOSTILE] Zones initialized: {combatZones.Count} total, {sceneBattleGroups.Count} BattleGroups");
 
             // Dump zones to file for reference
             try
@@ -6922,6 +7596,79 @@ namespace UW2Mod
                 File.WriteAllLines(zonesPath, zoneLines);
             }
             catch { }
+        }
+
+        /// Activate all BattleGroups within range of a position, targeting the player
+        private int ActivateBattleGroupsNear(Vector3 center, float range)
+        {
+            int activated = 0;
+            var ac = GameManager.ControllerAircraft;
+            if (ac == null) return 0;
+            var playerITargetable = ac.TryCast<Il2CppActor.ITargetable>();
+            if (playerITargetable == null) return 0;
+
+            for (int i = 0; i < sceneBattleGroups.Count; i++)
+            {
+                try
+                {
+                    var bg = sceneBattleGroups[i];
+                    if (bg == null || bg.gameObject == null) continue;
+                    if (bg.m_groupIsActive) continue; // already active
+                    float dist = Vector3.Distance(bg.transform.position, center);
+                    if (dist > range) continue;
+
+                    bg._SetActive(playerITargetable);
+                    activated++;
+                    LoggerInstance.Msg($"[HOSTILE] BattleGroup '{bg.gameObject.name}' ACTIVATED (dist={dist:F0}m)");
+                }
+                catch (Exception ex) { LoggerInstance.Msg($"[HOSTILE] BG activate error: {ex.Message}"); }
+            }
+            return activated;
+        }
+
+        /// Activate ALL scanned BattleGroups targeting the player
+        private int ActivateAllBattleGroups()
+        {
+            int activated = 0;
+            var ac = GameManager.ControllerAircraft;
+            if (ac == null) return 0;
+            var playerITargetable = ac.TryCast<Il2CppActor.ITargetable>();
+            if (playerITargetable == null) return 0;
+
+            for (int i = 0; i < sceneBattleGroups.Count; i++)
+            {
+                try
+                {
+                    var bg = sceneBattleGroups[i];
+                    if (bg == null || bg.gameObject == null) continue;
+                    if (bg.m_groupIsActive) continue;
+                    bg._SetActive(playerITargetable);
+                    activated++;
+                    LoggerInstance.Msg($"[HOSTILE] BattleGroup '{bg.gameObject.name}' ACTIVATED");
+                }
+                catch (Exception ex) { LoggerInstance.Msg($"[HOSTILE] BG activate error: {ex.Message}"); }
+            }
+            return activated;
+        }
+
+        /// Deactivate all BattleGroups
+        private int DeactivateAllBattleGroups()
+        {
+            int deactivated = 0;
+            for (int i = 0; i < sceneBattleGroups.Count; i++)
+            {
+                try
+                {
+                    var bg = sceneBattleGroups[i];
+                    if (bg == null || bg.gameObject == null) continue;
+                    if (!bg.m_groupIsActive) continue;
+                    bg._SetInactive();
+                    deactivated++;
+                }
+                catch { }
+            }
+            if (deactivated > 0) LoggerInstance.Msg($"[HOSTILE] Deactivated {deactivated} BattleGroups");
+            return deactivated;
         }
 
         private void CheckUnlocks()
@@ -7629,19 +8376,16 @@ namespace UW2Mod
                 return;
             }
 
-            // A button (right controller) = secondary weapon, hold to fire continuously
+            // Left trigger = secondary weapon, hold to fire continuously
             // G key = keyboard fallback
-            bool aButton = false;
-            try { aButton = OVRInput.Get(OVRInput.Button.One, OVRInput.Controller.RTouch); } catch { }
-            // Also try raw button in case mapped differently
-            bool aButtonRaw = false;
-            try { aButtonRaw = OVRInput.Get(OVRInput.RawButton.A); } catch { }
-            bool firing = aButton || aButtonRaw || Input.GetKey(KeyCode.G);
+            bool leftTrigger = false;
+            try { leftTrigger = OVRInput.Get(OVRInput.Axis1D.PrimaryIndexTrigger, OVRInput.Controller.LTouch) > 0.5f; } catch { }
+            bool firing = leftTrigger || Input.GetKey(KeyCode.G);
 
             // Debug: log once when first detected
             if (firing && !leftTriggerWasDown)
             {
-                LoggerInstance.Msg($"[HS] Secondary input detected: aButton={aButton} aButtonRaw={aButtonRaw} G={Input.GetKey(KeyCode.G)} cachedFM={cachedSecondaryFM != null}");
+                LoggerInstance.Msg($"[HS] Secondary input detected: leftTrigger={leftTrigger} G={Input.GetKey(KeyCode.G)} cachedFM={cachedSecondaryFM != null}");
                 leftTriggerWasDown = true;
             }
             if (!firing) leftTriggerWasDown = false;
@@ -7957,6 +8701,208 @@ namespace UW2Mod
                 SetStatus($"Model swapped to {npcName}!");
             }
             catch (Exception ex) { SetStatus($"Swap failed: {ex.Message}"); }
+        }
+
+        // ================================================================
+        // FLYBY CAMERA — detached orbit camera for cinematic shots
+        // ================================================================
+        private void ToggleFlybyCam()
+        {
+            if (flybyCamActive)
+            {
+                // Restore camera
+                try
+                {
+                    var camRoot = GameManager.CameraRoot;
+                    if (camRoot != null && flybyCamOrigParent != null)
+                    {
+                        camRoot.SetParent(flybyCamOrigParent);
+                        camRoot.localPosition = flybyCamOrigLocalPos;
+                        camRoot.localRotation = flybyCamOrigLocalRot;
+                    }
+                    // Resume game camera control
+                    var eyeControllers = GameObject.FindObjectsOfType<Il2Cpp.CameraEyeController>();
+                    for (int i = 0; i < (eyeControllers?.Count ?? 0); i++)
+                        try { eyeControllers[i].Resume(); } catch { }
+                }
+                catch (Exception ex) { LoggerInstance.Msg($"[FLYBY] Restore failed: {ex.Message}"); }
+
+                if (flybyCamPivot != null) { GameObject.Destroy(flybyCamPivot); flybyCamPivot = null; }
+                flybyCamActive = false;
+                SetStatus("Flyby Camera OFF");
+            }
+            else
+            {
+                var ac = GameManager.ControllerAircraft;
+                if (ac == null) { SetStatus("Not in aircraft"); return; }
+
+                var camRoot = GameManager.CameraRoot;
+                if (camRoot == null) { SetStatus("No camera root"); return; }
+
+                // Save original camera state
+                flybyCamOrigParent = camRoot.parent;
+                flybyCamOrigLocalPos = camRoot.localPosition;
+                flybyCamOrigLocalRot = camRoot.localRotation;
+
+                // Pause game camera control so it doesn't fight us
+                var eyeControllers = GameObject.FindObjectsOfType<Il2Cpp.CameraEyeController>();
+                for (int i = 0; i < (eyeControllers?.Count ?? 0); i++)
+                    try { eyeControllers[i].Pause(); } catch { }
+
+                // Create orbit pivot that follows the aircraft
+                flybyCamPivot = new GameObject("HS_FlybyCamPivot");
+                GameObject.DontDestroyOnLoad(flybyCamPivot);
+
+                // Initial orbit angle behind the aircraft
+                flybyCamOrbitAngle = ac.transform.eulerAngles.y + 180f;
+                flybyCamPitch = 15f;
+                flybyCamMode = 0; // default to orbit
+
+                flybyCamActive = true;
+                SetStatus("Flyby Camera ON — auto-orbiting, sticks still fly the plane");
+            }
+        }
+
+        private void UpdateFlybyCam()
+        {
+            if (!flybyCamActive) return;
+
+            var ac = GameManager.ControllerAircraft;
+            if (ac == null) { ToggleFlybyCam(); return; }
+
+            var camRoot = GameManager.CameraRoot;
+            if (camRoot == null) return;
+
+            // Keyboard-only orbit control (sticks are used for flying)
+            if (!showMenu && !wristPanelVisible)
+            {
+                float rX = 0f, rY = 0f, dist = 0f;
+                if (Input.GetKey(KeyCode.J)) rX = -1f;
+                if (Input.GetKey(KeyCode.L)) rX = 1f;
+                if (Input.GetKey(KeyCode.I)) rY = 1f;
+                if (Input.GetKey(KeyCode.K)) rY = -1f;
+                if (Input.GetKey(KeyCode.U)) dist = -1f;
+                if (Input.GetKey(KeyCode.O)) dist = 1f;
+
+                flybyCamOrbitAngle += rX * 90f * Time.unscaledDeltaTime;
+                flybyCamPitch = Mathf.Clamp(flybyCamPitch + rY * 60f * Time.unscaledDeltaTime, -10f, 80f);
+                flybyCamDistance = Mathf.Clamp(flybyCamDistance + dist * 30f * Time.unscaledDeltaTime, 5f, 200f);
+            }
+
+            // Auto orbit (default ON — hands-free cinematic)
+            if (flybyCamAutoOrbit)
+                flybyCamOrbitAngle += flybyCamAutoSpeed * Time.unscaledDeltaTime;
+
+            Vector3 acPos = ac.transform.position;
+            Vector3 camPos;
+            Quaternion lookRot;
+
+            if (flybyCamMode == 1)
+            {
+                // STREET VIEW — camera stays at fixed world position, tracks the plane
+                camPos = flybyCamStreetPos;
+                Vector3 toPlane = acPos - camPos;
+                if (toPlane.sqrMagnitude > 0.01f)
+                    lookRot = Quaternion.LookRotation(toPlane, Vector3.up);
+                else
+                    lookRot = camRoot.rotation;
+            }
+            else
+            {
+                // ORBIT — camera circles the aircraft
+                flybyCamPivot.transform.position = acPos;
+
+                float radH = flybyCamOrbitAngle * Mathf.Deg2Rad;
+                float radV = flybyCamPitch * Mathf.Deg2Rad;
+                float cosV = Mathf.Cos(radV);
+                Vector3 orbitOffset = new Vector3(
+                    Mathf.Sin(radH) * cosV * flybyCamDistance,
+                    Mathf.Sin(radV) * flybyCamDistance,
+                    Mathf.Cos(radH) * cosV * flybyCamDistance
+                );
+
+                camPos = acPos + orbitOffset;
+                lookRot = Quaternion.LookRotation(acPos - camPos, Vector3.up);
+            }
+
+            // Set camera root directly
+            camRoot.SetParent(null);
+            camRoot.position = camPos;
+            camRoot.rotation = lookRot;
+        }
+
+        // ================================================================
+        // AUTOPILOT — maintain heading with auto-level + boost
+        // ================================================================
+        private void ToggleAutopilot()
+        {
+            if (autopilotActive)
+            {
+                // Restore original auto-level values
+                try
+                {
+                    var ac = GameManager.ControllerAircraft;
+                    if (ac != null)
+                    {
+                        var rta = ac.gameObject.GetComponent<RigidTargetableAircraft>();
+                        if (rta != null)
+                        {
+                            var cfg = rta.m_aircraftControllerConfig;
+                            if (cfg != null && autopilotOrigAutoRoll >= 0f)
+                            {
+                                cfg.AutoRollLevel = autopilotOrigAutoRoll;
+                                cfg.AutoPitchLevel = autopilotOrigAutoPitch;
+                            }
+                        }
+                    }
+                }
+                catch { }
+                autopilotActive = false;
+                SetStatus("Autopilot OFF");
+            }
+            else
+            {
+                var ac = GameManager.ControllerAircraft;
+                if (ac == null) { SetStatus("Not in aircraft"); return; }
+
+                try
+                {
+                    var rta = ac.gameObject.GetComponent<RigidTargetableAircraft>();
+                    if (rta != null)
+                    {
+                        var cfg = rta.m_aircraftControllerConfig;
+                        if (cfg != null)
+                        {
+                            // Save originals
+                            autopilotOrigAutoRoll = cfg.AutoRollLevel;
+                            autopilotOrigAutoPitch = cfg.AutoPitchLevel;
+                            // Crank auto-level way up so plane stabilizes itself
+                            cfg.AutoRollLevel = 8f;
+                            cfg.AutoPitchLevel = 8f;
+                        }
+                    }
+                    // Apply gentle boost if not already boosting
+                    if (continuousBoost < 2000) continuousBoost = 2000;
+                }
+                catch (Exception ex) { SetStatus($"Autopilot failed: {ex.Message}"); return; }
+
+                autopilotActive = true;
+                SetStatus("Autopilot ON — plane flies level, sticks still work");
+            }
+        }
+
+        // ================================================================
+        // SLOW MOTION
+        // ================================================================
+        private void SetSlowMo(float scale, string label)
+        {
+            if (savedFixedDeltaTime < 0f)
+                savedFixedDeltaTime = Time.fixedDeltaTime;
+
+            targetTimeScale = scale;
+            Time.timeScale = scale;
+            Time.fixedDeltaTime = savedFixedDeltaTime * scale;
+            SetStatus($"Time: {label}");
         }
 
         // ================================================================
